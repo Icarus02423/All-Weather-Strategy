@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 # 日常修改日期和品种时，优先修改这一段。
-START_DATE = "2014-01-01"
+START_DATE = "2013-09-06"
 END_DATE = "2026-09-30"  # 留空：上海时间的昨天；也可填写 YYYY-MM-DD。
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "data" / "futures"
