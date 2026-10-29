@@ -13,8 +13,6 @@ __pycache__/
 .idea/
 .DS_Store
 
-# Downloaded data, generated results, and logs
-data/
-outputs/
+# Logs
 logs/
 *.log
