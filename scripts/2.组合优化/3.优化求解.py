@@ -1,8 +1,9 @@
 """在原四维仓位 x 上求解期货风险预算配置，并返回完整计算轨迹。
 
 问题：min (sqrt(x.T @ Q @ x) - target)**2，x > 0；
-      四组风险份额等于 b，非债名义敞口 h.T @ x <= 1。
-默认组序为股票、国债、黄金、其他商品，默认 h=(1,0,1,1)。
+      四组风险份额等于 b，最低保证金资金占用 h.T @ x <= 1。
+组序为股票、国债、黄金、其他商品，h=(1, bond_margin_floor, 1, 1)。
+最低保证金率必须显式传入；求解后由 m_B=(1-x_S-x_G-x_C)/x_B 恢复。
 
 这里只求解，不读取行情、准备表或 Excel，也不保存任何文件。Q 必须
 对称正定；输入不合格会明确报错，不自动对称化、改预算或修补协方差。
@@ -407,7 +408,8 @@ def solve_allocation(Q, b, target, *, bond_margin_floor, x0=None, initial_points
                      trace_level="full"):
     """返回 target_achieved / cap_limited / numerical_failure。
 
-    Q、b、h 和 x 的位置必须一致。max_iter 是每次尝试的最大更新次数；
+    Q、b 和 x 按 S,B,G,C 排列；h 由显式传入的 bond_margin_floor 构造。
+    max_iter 是每次尝试的最大更新次数；
     max_backtracks 是每轮最多试探步长数（包含第一次完整步长）。四个
     tolerance 都必须是有限正数。full 记录每轮全部矩阵和试探步原因；
     standard 省略大矩阵与逐次试探表，仍保留初值、乘子和逐轮关键状态。
