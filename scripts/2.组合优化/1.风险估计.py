@@ -353,7 +353,8 @@ def estimate_risk(
     且每类按1/n等分。频率、风险预算、波动率参数不参与本函数。
 
     返回带类别标签的covariance、annual_volatility和class_returns，
-    以及日期、样本数量、allocations和diagnostics。协方差单位为年化
+    以及未乘类内权重的instrument_returns和对应的instrument_covariance。
+    同时返回日期、样本数量、allocations和diagnostics。协方差单位为年化
     收益率平方；所有收益观测完整共同对齐，不做成对缺失协方差估计。
     """
     context = f"signal_date={signal_date}, lookback={lookback}"
@@ -492,10 +493,14 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
     AnnualCovariance starts at A14, with its header at A15:E15 and data in
     A16:E19. AnnualVolatility starts at G14, header G15:H15, data G16:H19.
     Allocations starts at A22 (header row 23). ClassReturns follows after one
-    empty row; Diagnostics follows its data after one empty row. These latter
-    sections can be found by their exact English section titles in column A.
-    All Overview fields are retained either above, in AnnualVolatility, or in
-    Diagnostics. Full run metadata is retained in workbook properties.
+    empty row. Diagnostics is at G22 beside the class covariance/volatility;
+    data_version is in the top parameter area at G3:H3.
+    InstrumentAnnualCovariance starts at J14; unweighted
+    InstrumentReturns starts in column J alongside the existing ClassReturns.
+    InstrumentAnnualVolatility is placed to the right of its covariance, with
+    InstrumentDiagnostics below it. Existing covariance/return/allocation
+    cells, their column widths and the original filter remain unchanged.
+    Full run metadata is retained in workbook properties.
     """
     try:
         from openpyxl import Workbook
@@ -867,7 +872,7 @@ def run_risk_history(
 def build_output_tables(
     results: list[dict[str, Any]], metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, pd.DataFrame]:
-    """把逐期结果整理为内存中的四个规范数据表，供下游和按期导出使用。"""
+    """保留原四张内存表，另加品种协方差和未加权收益表，供按期导出。"""
     if not results:
         raise ValueError("Cannot build output tables without period results.")
     metadata = dict(metadata or {})
