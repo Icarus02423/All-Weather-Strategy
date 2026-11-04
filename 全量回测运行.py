@@ -1,3 +1,10 @@
+"""在 PyCharm 中直接运行本文件，完成全部135组参数的风险估计、优化和回测。
+
+沿用 outputs/risk_estimate、outputs/optimization、outputs/backtest 的目录及格式。
+每次运行重新计算并更新对应结果；不下载行情，不改调仓安排，不清空其他目录。
+逐方案依次执行三个步骤，任何步骤失败立即停止，保留已完成结果供检查。
+导入本文件不会运行任务；所有子程序使用当前 Python 解释器。
+"""
 from __future__ import annotations
 
 from datetime import date
@@ -37,6 +44,7 @@ SCRIPTS = {
 
 
 def _preflight():
+    """在任何输出更新前检查必需文件、依赖及日期设置。"""
     required = [
         *SCRIPTS.values(),
         "scripts/2.组合优化/3.优化求解.py",
@@ -70,6 +78,7 @@ def _preflight():
 
 
 def _steps(lookback, frequency):
+    """只构建命令，不运行；各阶段使用相同输入和参数。"""
     common = [
         "--lookback-period", lookback, "--frequency", frequency,
         "--prices", str(PROJECT_ROOT / "data/futures/close_price.csv"),
