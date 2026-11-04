@@ -24,8 +24,7 @@ from numbers import Integral, Real
 import numpy as np
 
 
-MODEL_VERSION = "original_x_squared_volatility_gap_hard_risk_budget_v1.0"
-DEFAULT_H = np.array([1.0, 0.0, 1.0, 1.0])
+MODEL_VERSION = "original_x_bond_margin_floor_1.0"
 
 
 def _real_scalar(value, name, positive=True):
@@ -69,10 +68,13 @@ def _real_array(value, name, shape):
     return array
 
 
-def _inputs(Q, b, target, h):
+def _inputs(Q, b, target, bond_margin_floor):
     Q = _real_array(Q, "Q", (4, 4))
     b = _real_array(b, "b", (4,))
-    h = DEFAULT_H.copy() if h is None else _real_array(h, "h", (4,))
+    margin_floor = _real_scalar(bond_margin_floor, "bond_margin_floor")
+    if not np.isfinite(1.0 / margin_floor):
+        raise ValueError("bond_margin_floor 的倒数必须是有限的国债杠杆上限。")
+    h = np.array([1.0, margin_floor, 1.0, 1.0])
     # 与已验证原型一致：精确检查对称，不悄悄用 (Q+Q.T)/2 替换输入。
     if not np.array_equal(Q, Q.T):
         raise ValueError("Q 必须对称；本模块不会自动对称化，请检查协方差构造。")
@@ -82,8 +84,6 @@ def _inputs(Q, b, target, h):
         raise ValueError("Q 必须正定；本求解器不支持奇异或非正定 Q。") from exc
     if np.any(b <= 0) or not np.isclose(b.sum(), 1.0, rtol=0, atol=1e-14):
         raise ValueError("b 的四项必须严格为正且合计为 1；不自动归一化预算。")
-    if np.any(h < 0) or not np.any(h > 0):
-        raise ValueError("h 必须非负且至少有一个正分量。")
     return Q, b, _real_scalar(target, "target"), h
 
 
@@ -186,7 +186,7 @@ def evaluate_kkt(z, Q, b, target, h, active_cap):
         "constraint_jacobian": jacobian,
         "lagrangian_hessian": lagrangian_hessian,
         "stationarity": stationarity, "residual": residual,
-        "kkt_matrix": kkt_matrix, "cap_exposure": cap_exposure,
+        "kkt_matrix": kkt_matrix, "capital_used_at_floor": cap_exposure,
     }
     if any(not np.isfinite(value).all() for value in state.values()):
         raise FloatingPointError("KKT 状态或矩阵包含非有限数值。")
@@ -204,7 +204,7 @@ def _history_record(iteration, z, state, trace_level):
         "all_risk_equations": state["all_risk_equations"].copy(),
         "stationarity": state["stationarity"].copy(),
         "residual_max": float(np.max(np.abs(state["residual"]))),
-        "cap_exposure": state["cap_exposure"],
+        "capital_used_at_floor": state["capital_used_at_floor"],
         "step_size": None, "backtracks": 0, "line_search_evaluations": 0,
         "direction": None, "linear_solve_residual_max": None,
         "update_accepted": False, "termination_reason": None,
@@ -328,7 +328,7 @@ def _postcheck(root, Q, b, target, h, residual_tol, budget_tol, cap_tol, vol_tol
     active_cap = root["active_cap"]
     state = evaluate_kkt(z, Q, b, target, h, active_cap)
     x = z[:4]
-    cap = state["cap_exposure"]
+    cap = state["capital_used_at_floor"]
     multiplier = float(z[-1]) if active_cap else 0.0
     errors = {
         "stationarity_max": float(np.max(np.abs(state["stationarity"]))),
@@ -373,20 +373,35 @@ def _postcheck(root, Q, b, target, h, residual_tol, budget_tol, cap_tol, vol_tol
             failed.append("active_point_above_target")
     elif errors["target_error"] > vol_tol:
         failed.append("inactive_point_not_at_target")
+    non_bond = float(x[[0, 2, 3]].sum())
+    bond_capital = 1.0 - non_bond
+    margin_rate = bond_capital / float(x[1])
+    leverage = float(x[1]) / bond_capital if bond_capital > 0 else None
+    # 超限的未绑定根仍可作为绑定分支初值；只有可行候选才验算恢复的 m_B。
+    if errors["cap_violation"] <= cap_tol:
+        if (not np.isfinite(margin_rate) or margin_rate <= 0 or leverage is None
+                or not np.isfinite(leverage)):
+            failed.append("invalid_bond_capital")
+        elif max(0.0, (h[1] - margin_rate) * x[1]) > cap_tol:
+            failed.append("bond_margin_floor")
     return {
         "passed": not failed, "failed_checks": failed, "errors": errors,
         "x": x.copy(), "budget_multipliers": z[4:7].copy(),
         "cap_multiplier": multiplier, "active_cap": active_cap,
-        "cap_exposure": cap, "gross_exposure": gross_exposure,
+        "capital_used_at_floor": cap, "gross_exposure": gross_exposure,
         "volatility": state["volatility"], "variance": state["variance"],
         "objective": state["objective"], "qx": state["qx"].copy(),
         "risk_shares": state["risk_shares"].copy(),
         "risk_numerators": state["risk_numerators"].copy(),
         "risk_contributions": risk_contributions,
+        "bond_margin_floor": float(h[1]), "bond_leverage_cap": 1.0 / float(h[1]),
+        "bond_margin_rate": margin_rate, "bond_leverage": leverage,
+        "non_bond_exposure": non_bond, "bond_exposure": float(x[1]),
+        "bond_capital_weight": bond_capital, "capital_usage": non_bond + margin_rate * x[1],
     }
 
 
-def solve_allocation(Q, b, target, h=None, x0=None, initial_points=None,
+def solve_allocation(Q, b, target, *, bond_margin_floor, x0=None, initial_points=None,
                      max_iter=100, residual_tol=1e-13, budget_tol=1e-8,
                      cap_tol=1e-10, vol_tol=1e-10, max_backtracks=60,
                      trace_level="full"):
@@ -402,7 +417,7 @@ def solve_allocation(Q, b, target, h=None, x0=None, initial_points=None,
     作初值，不做缩放。attempts 记录每次分支尝试及接受或拒绝理由。
     返回的「通过」表示在给定容差内通过验算，不声称算法全局收敛。
     """
-    Q, b, target, h = _inputs(Q, b, target, h)
+    Q, b, target, h = _inputs(Q, b, target, bond_margin_floor)
     max_iter = _integer(max_iter, "max_iter", 0)
     max_backtracks = _integer(max_backtracks, "max_backtracks", 1)
     residual_tol = _real_scalar(residual_tol, "residual_tol")
@@ -443,7 +458,7 @@ def solve_allocation(Q, b, target, h=None, x0=None, initial_points=None,
         return root, check
 
     def success(root, check, status):
-        if not check["passed"] or check["cap_exposure"] > 1 + cap_tol:
+        if not check["passed"] or check["capital_used_at_floor"] > 1 + cap_tol:
             raise AssertionError("禁止将未通过验算或超限的仓位返回为成功。")
         root["accepted"] = True
         root["acceptance_reason"] = (
@@ -495,5 +510,5 @@ def solve_allocation(Q, b, target, h=None, x0=None, initial_points=None,
 
 
 if __name__ == "__main__":
-    print("本程序提供 solve_allocation(Q, b, target, ...)；请由 2.逐期运行.py 导入调用。")
+    print("本程序提供 solve_allocation(Q, b, target, bond_margin_floor=...)；请由 2.逐期运行.py 导入调用。")
     print("只返回仓位、验算及迭代轨迹，不读取行情、不保存文件。")
