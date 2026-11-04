@@ -356,8 +356,9 @@ def complete_result(risk: dict, solution: dict, b: np.ndarray, h: np.ndarray,
     stationarity = gradient + budget_jacobian.T @ solution["budget_multipliers"] + cap_multiplier * h
 
     def check(name, error, tolerance, passed=None, detail=""):
+        finite = math.isfinite(float(error)) and math.isfinite(float(tolerance))
         result["checks"].append({"check": name, "error": float(error), "tolerance": float(tolerance),
-                                 "passed": bool(error <= tolerance if passed is None else passed), "detail": detail})
+                                 "passed": bool(finite and (error <= tolerance if passed is None else passed)), "detail": detail})
     check("positive_group_exposures", float(np.min(x)), 0, bool(np.all(x > 0)), "Strictly greater than zero")
     check("all_four_risk_shares", np.max(np.abs(group_shares - b)), solver_options["budget_tol"])
     check("non_bond_cap", max(0, cap - 1), solver_options["cap_tol"])
