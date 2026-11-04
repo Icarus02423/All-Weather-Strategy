@@ -365,11 +365,19 @@ def estimate_risk(
         returns, price_start, price_end = _get_returns(prices, signal, days, weights)
         class_returns = _get_class_returns(returns, weights)
         covariance, volatility, diagnostics = _estimate_covariance(class_returns, factor)
+        with np.errstate(over="raise", invalid="raise"):
+            instrument_matrix = np.cov(returns.to_numpy(dtype=float), rowvar=False, ddof=1) * factor
+        if instrument_matrix.shape != (len(returns.columns), len(returns.columns)) or not np.isfinite(instrument_matrix).all():
+            raise ValueError("Instrument covariance must be a finite matrix covering the selected instruments.")
+        instrument_covariance = pd.DataFrame(
+            instrument_matrix, index=returns.columns, columns=returns.columns,
+        )
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(f"Risk estimation failed ({context}): {exc}") from exc
     return {
         "covariance": covariance, "asset_classes": ASSET_CLASSES,
         "annual_volatility": volatility, "class_returns": class_returns,
+        "instrument_returns": returns, "instrument_covariance": instrument_covariance,
         "allocations": weights, "signal_date": signal, "lookback": days,
         "price_start": price_start, "price_end": price_end,
         "return_start": returns.index[0], "return_end": returns.index[-1],
