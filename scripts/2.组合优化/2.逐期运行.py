@@ -3,13 +3,14 @@
 Python 3.9+；使用项目已有 numpy、pandas、openpyxl，不生成 JSON 文件。
 直接运行处理顶部所选方案；导入本文件不会读取、计算或保存数据。
 
-已有风险工作簿是四组 Q 和当期名单的来源。旧工作簿未保存品种 Sigma，
-因此只读原价格，严格按该工作簿的窗口和名单补算 A、Sigma，并与原来的
-ClassReturns、Q 交叉核对。优化始终使用 Excel 中的 Q，不替换、不修补。
+已有风险工作簿提供四组 Q、品种 Sigma、两层收益率和当期名单。
+原价格只用于独立核对；优化及风险贡献使用 Excel 中的矩阵，不替换、不修补。
+每期对目标波动率和国债杠杆上限逐一组合；最低保证金率为杠杆上限的倒数。
+求解 n + margin_floor*x_B <= 1，再由 m_B=(1-n)/x_B 恢复整体保证金率。
 准备表只用于核对原安排，不重新制定新品种纳入规则。输出仍为 Excel。
 
 目录示例：outputs/optimization/Lookback_Quarterly_Rebalance_Monthly/
-TargetVol_05pct/001.xlsx。001 是原调仓序号，不是运行次数。
+TargetVol_05pct/BondLeverageCap_50x/001.xlsx。001 是原调仓序号，不是运行次数。
 默认不覆盖；失败先保存诊断工作簿再停止。测试请显式使用独立输出目录。
 """
 from __future__ import annotations
@@ -128,7 +129,7 @@ def _number(value: Any, field: str) -> float:
 
 
 def _section(rows: list[tuple], title: str, headers: tuple[str, ...], *, exact_headers: bool = False) -> list[dict]:
-    """按现有工作簿的区块标题及列名读取，不依赖区块所在的固定行号。"""
+    """按唯一的区块标题及列名定位，兼容原布局与移到矩阵旁的诊断区。"""
     found = [(i, j) for i, row in enumerate(rows) for j, value in enumerate(row) if value == title]
     if len(found) != 1:
         raise ValueError(f"Expected exactly one {title} section")
@@ -291,7 +292,7 @@ def read_risk_workbook(path: Path) -> dict:
 
 def prepare_period(risk: dict, schedule_row: dict, prices: pd.DataFrame,
                    price_hash: str, schedule_hash: str) -> dict:
-    """只读补算旧 Excel 未存的 A、Sigma；核对通过后仍使用原 Excel Q。"""
+    """由类内权重构造 A；原价格仅核对，保留 Excel 的 Q、Sigma 和收益率。"""
     fields = risk["fields"]
     for key, other in (("rebalance_no", "rebalance_no"), ("signal_date", "signal_date"),
                        ("execution_date", "execution_date"), ("lookback_days", "lookback"),
@@ -526,7 +527,7 @@ def _matrix_rows(label: str, matrix: Any, row_labels: list, col_labels: list,
 def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
                   b: np.ndarray, h: np.ndarray, target: float, solver_options: dict,
                   sources: dict, overwrite: bool = False) -> None:
-    """保存一个时期、一个目标的结果；失败仍保留输入及已有求解轨迹。"""
+    """保存一期、一个目标和一档保证金下限；失败仍保留输入及已有轨迹。"""
     path = Path(path)
     if path.is_symlink() or (path.exists() and not overwrite):
         raise FileExistsError(f"Output exists or is a symbolic link: {path}")
@@ -675,7 +676,7 @@ def run_history(*, project_root: Path = PROJECT_ROOT, lookback_period: str = LOO
                 targets=TARGET_VOLATILITIES, leverage_caps=BOND_LEVERAGE_CAPS, budgets=None, risk_root=None, output_root=None,
                 prices_path=None, schedule_path=None, overwrite: bool = OVERWRITE_OUTPUTS,
                 failure_policy: str = FAILURE_POLICY, solver_options: Optional[dict] = None) -> dict:
-    """独立运行一套窗口/频率。只读输入，每期每目标输出一个 Excel。
+    """独立运行一套窗口/频率。只读输入，每期每目标每杠杆上限输出一个 Excel。
 
     若默认 stop 模式失败，先保存失败工作簿再抛 BatchFailure。
     continue 模式保留所有失败并返回 partial_failure，不把失败期用于回测。
