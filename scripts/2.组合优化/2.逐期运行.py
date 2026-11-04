@@ -127,27 +127,31 @@ def _number(value: Any, field: str) -> float:
     return value
 
 
-def _section(rows: list[tuple], title: str, headers: tuple[str, ...]) -> list[dict]:
+def _section(rows: list[tuple], title: str, headers: tuple[str, ...], *, exact_headers: bool = False) -> list[dict]:
     """按现有工作簿的区块标题及列名读取，不依赖区块所在的固定行号。"""
-    found = [i for i, row in enumerate(rows) if row and row[0] == title]
+    found = [(i, j) for i, row in enumerate(rows) for j, value in enumerate(row) if value == title]
     if len(found) != 1:
         raise ValueError(f"Expected exactly one {title} section")
-    i = found[0] + 1
-    # 同一行右侧还有 AnnualVolatility 小表；只解析左侧连续表头。
+    title_row, start_column = found[0]
+    i = title_row + 1
+    # 同一行可能有并列区块；只解析从标题所在列开始的连续表头。
     header = []
     if i < len(rows):
-        for value in rows[i]:
+        for value in rows[i][start_column:]:
             if value in (None, ""):
                 break
             header.append(value)
     if any(header.count(h) != 1 for h in headers):
         raise ValueError(f"Invalid headers in {title}")
+    if exact_headers and (len(header) != len(headers) or set(header) != set(headers)):
+        raise ValueError(f"Unexpected columns in {title}")
     positions = {h: header.index(h) for h in headers}
     result = []
     for row in rows[i + 1:]:
-        if not row or row[0] in (None, ""):
+        if len(row) <= start_column or row[start_column] in (None, ""):
             break
-        result.append({h: row[j] if j < len(row) else None for h, j in positions.items()})
+        result.append({h: row[start_column + j] if start_column + j < len(row) else None
+                       for h, j in positions.items()})
     if not result:
         raise ValueError(f"Empty {title} section")
     return result
@@ -174,7 +178,7 @@ def read_risk_workbook(path: Path) -> dict:
             raise ValueError("Missing or duplicate AnnualCovariance section")
         fields = {}
         for row in rows[:markers[0]]:
-            for j in (0, 3):
+            for j in (0, 3, 6):
                 if len(row) > j + 1 and isinstance(row[j], str) and re.fullmatch(r"[a-z]+(?:_[a-z]+)+", row[j]):
                     if row[j] in fields:
                         raise ValueError(f"Duplicate period field: {row[j]}")
@@ -233,6 +237,32 @@ def read_risk_workbook(path: Path) -> dict:
             raise ValueError("Class return dates must be unique and ascending")
         group_returns = np.array([[_number(r[g], "class_return") for g in GROUP_ORDER] for r in observations])
         diagnostics = {r["field"]: r["value"] for r in _section(rows, "Diagnostics", ("field", "value"))}
+        instrument_codes = [code for group in GROUP_ORDER for code in allocations[group]]
+        instrument_rows = _section(rows, "InstrumentAnnualCovariance", ("instrument_code", *instrument_codes), exact_headers=True)
+        if Counter(r["instrument_code"] for r in instrument_rows) != Counter(instrument_codes):
+            raise ValueError("Instrument covariance rows must match Allocations exactly")
+        by_code = {r["instrument_code"]: r for r in instrument_rows}
+        Sigma = np.array([[_number(by_code[code][other], "Sigma") for other in instrument_codes]
+                          for code in instrument_codes])
+        if not np.array_equal(Sigma, Sigma.T) or np.any(np.diag(Sigma) < 0):
+            raise ValueError("Instrument covariance must be symmetric with nonnegative variances")
+        # 品种矩阵可以奇异；不增加正定要求，也不修补矩阵。
+        instrument_observations = _section(rows, "InstrumentReturns", ("return_date", *instrument_codes), exact_headers=True)
+        instrument_days = pd.DatetimeIndex([_date(r["return_date"], "instrument return date") for r in instrument_observations])
+        if not instrument_days.equals(days):
+            raise ValueError("InstrumentReturns dates must match ClassReturns exactly")
+        instrument_returns = np.array([[_number(r[c], "instrument return") for c in instrument_codes]
+                                       for r in instrument_observations])
+        volatilities = {}
+        for title, label, labels in (("AnnualVolatility", "asset_class", GROUP_ORDER),
+                                     ("InstrumentAnnualVolatility", "instrument_code", instrument_codes)):
+            entries = _section(rows, title, (label, "annual_volatility"), exact_headers=True)
+            if Counter(r[label] for r in entries) != Counter(labels):
+                raise ValueError(f"Unexpected or duplicate labels in {title}")
+            by_label = {r[label]: _number(r["annual_volatility"], title) for r in entries}
+            volatilities[title] = np.array([by_label[name] for name in labels])
+        instrument_diagnostics = {r["field"]: r["value"] for r in
+                                  _section(rows, "InstrumentDiagnostics", ("field", "value"), exact_headers=True)}
         description = book.properties.description
         try:
             metadata = json.loads(description) if description else {}
@@ -251,6 +281,10 @@ def read_risk_workbook(path: Path) -> dict:
         raise ValueError("Risk workbook changed while being read")
     return {"fields": fields, "Q": Q, "allocations": allocations,
             "return_dates": days, "class_returns": group_returns,
+            "Sigma": Sigma, "instrument_codes": instrument_codes, "instrument_returns": instrument_returns,
+            "annual_volatility": volatilities["AnnualVolatility"],
+            "instrument_annual_volatility": volatilities["InstrumentAnnualVolatility"],
+            "source_instrument_diagnostics": instrument_diagnostics,
             "source_diagnostics": diagnostics, "metadata": metadata,
             "source_path": path.resolve(), "source_sha256": original_hash}
 
@@ -275,7 +309,7 @@ def prepare_period(risk: dict, schedule_row: dict, prices: pd.DataFrame,
     end = prices.index.get_loc(signal)
     if end < length:
         raise ValueError("Insufficient price history; the window will not be extended or filled")
-    codes = [code for g in GROUP_ORDER for code in allocations[g]]
+    codes = risk["instrument_codes"]
     if any(c not in prices.columns for c in codes):
         raise ValueError("A selected instrument is absent from the price table")
     window = prices.loc[:, codes].iloc[end - length:end + 1]
@@ -283,7 +317,7 @@ def prepare_period(risk: dict, schedule_row: dict, prices: pd.DataFrame,
     if not np.isfinite(values).all() or np.any(values <= 0):
         raise ValueError("Selected price window contains missing, nonfinite or nonpositive prices")
     with np.errstate(over="raise", divide="raise", invalid="raise"):
-        returns = values[1:] / values[:-1] - 1
+        price_returns = values[1:] / values[:-1] - 1
     expected_dates = window.index[1:]
     if not risk["return_dates"].equals(expected_dates):
         raise ValueError("ClassReturns dates do not match the exact L-return price window")
@@ -305,15 +339,20 @@ def prepare_period(risk: dict, schedule_row: dict, prices: pd.DataFrame,
         for j, group in enumerate(GROUP_ORDER):
             A[i, j] = allocations[group].get(code, 0)
     factor = fields["annualization_days"]
-    Sigma = np.cov(returns, rowvar=False, ddof=1) * factor
+    returns, Sigma = risk["instrument_returns"], risk["Sigma"]
     group_returns = returns @ A
-    direct_Q = np.cov(group_returns, rowvar=False, ddof=1) * factor
+    direct_Q = np.cov(risk["class_returns"], rowvar=False, ddof=1) * factor
     mapped_Q = A.T @ Sigma @ A
     checks = []
     for name, actual, expected in (
-            ("saved_class_returns_match_prices", group_returns, risk["class_returns"]),
+            ("saved_instrument_returns_match_prices", returns, price_returns),
+            ("saved_Sigma_matches_instrument_returns", Sigma, np.cov(returns, rowvar=False, ddof=1) * factor),
+            ("saved_class_returns_match_prices", price_returns @ A, risk["class_returns"]),
+            ("saved_class_returns_match_instruments", group_returns, risk["class_returns"]),
             ("saved_Q_matches_class_returns", direct_Q, risk["Q"]),
-            ("saved_Q_matches_A_Sigma_A", mapped_Q, risk["Q"])):
+            ("saved_Q_matches_A_Sigma_A", mapped_Q, risk["Q"]),
+            ("saved_class_volatility_matches_Q", risk["annual_volatility"], np.sqrt(np.diag(risk["Q"]))),
+            ("saved_instrument_volatility_matches_Sigma", risk["instrument_annual_volatility"], np.sqrt(np.diag(Sigma)))):
         difference = float(np.max(np.abs(actual - expected)))
         passed = bool(np.allclose(actual, expected, rtol=INPUT_RELATIVE_TOLERANCE, atol=INPUT_ABSOLUTE_TOLERANCE))
         checks.append({"check": name, "error": difference, "tolerance": INPUT_ABSOLUTE_TOLERANCE,
