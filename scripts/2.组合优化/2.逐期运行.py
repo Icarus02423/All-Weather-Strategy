@@ -42,9 +42,9 @@ REBALANCE_FREQUENCY = "monthly"      # monthly / quarterly / semiannual
 START_SIGNAL_DATE = "2014-12-31"
 END_SIGNAL_DATE = "2026-09-30"
 TARGET_VOLATILITIES = (0.05, 0.10, 0.15)
+BOND_LEVERAGE_CAPS = (50, 40, 30, 20, 10)  # 国债敞口/国债本金的上限；最低保证金率=1/上限
 RISK_BUDGETS = {"equity": 1 / 3, "bonds": 1 / 3,
                 "gold": 1 / 6, "other_commodities": 1 / 6}
-NON_BOND_GROUPS = ("equity", "gold", "other_commodities")  # 合计上限固定为1
 OVERWRITE_OUTPUTS = False
 FAILURE_POLICY = "stop"              # stop / continue；失败从不变成有效仓位
 
@@ -65,7 +65,7 @@ GROUP_SYMBOLS = ("S", "B", "G", "C")
 LOOKBACK_WINDOWS = {"quarterly": 63, "semiannual": 126, "annual": 252}
 FREQUENCY_NAMES = {"monthly": "Monthly", "quarterly": "Quarterly", "semiannual": "Semiannual"}
 PERIOD_NAMES = {"quarterly": "Quarterly", "semiannual": "Semiannual", "annual": "Annual"}
-RUNNER_VERSION = "new_objective_excel_v1"
+RUNNER_VERSION = "bond_margin_floor_excel_1.0"
 SUCCESS_STATUSES = {"target_achieved", "cap_limited"}
 
 
@@ -389,6 +389,20 @@ def complete_result(risk: dict, solution: dict, b: np.ndarray, h: np.ndarray,
     instrument_mrc = Sigma @ w / volatility
     instrument_rc = w * instrument_mrc
     cap = float(h @ x)
+    margin_floor = float(h[1])
+    non_bond = float(x[[0, 2, 3]].sum())
+    bond_capital = 1.0 - non_bond
+    if (not np.isfinite(bond_capital) or bond_capital <= 0 or x[1] <= 0):
+        result.update(status="postcheck_failed", error="Positive bond capital and exposure are required")
+        result["checks"].append({"check": "positive_bond_capital", "error": bond_capital,
+                                 "tolerance": 0, "passed": False})
+        return result
+    margin_rate = bond_capital / float(x[1])
+    leverage, leverage_cap = 1.0 / margin_rate, 1.0 / margin_floor
+    group_capital = x.copy()
+    group_capital[1] = margin_rate * x[1]
+    instrument_capital = A @ group_capital
+    capital_usage = non_bond + margin_rate * x[1]
     cap_multiplier = float(solution["cap_multiplier"])
     budget_jacobian = np.array([np.eye(4)[g] * qx[g] + x[g] * Q[g] - 2 * b[g] * qx for g in range(3)])
     gradient = 2 * (1 - target / volatility) * qx
@@ -400,7 +414,17 @@ def complete_result(risk: dict, solution: dict, b: np.ndarray, h: np.ndarray,
                                  "passed": bool(finite and (error <= tolerance if passed is None else passed)), "detail": detail})
     check("positive_group_exposures", float(np.min(x)), 0, bool(np.all(x > 0)), "Strictly greater than zero")
     check("all_four_risk_shares", np.max(np.abs(group_shares - b)), solver_options["budget_tol"])
-    check("non_bond_cap", max(0, cap - 1), solver_options["cap_tol"])
+    check("capital_cap_at_floor", max(0, cap - 1), solver_options["cap_tol"])
+    check("positive_bond_capital", bond_capital, 0, bond_capital > 0)
+    check("bond_margin_floor", max(0, margin_floor - margin_rate), solver_options["cap_tol"] / x[1])
+    check("bond_leverage_cap", max(0, leverage - leverage_cap), solver_options["cap_tol"] * leverage_cap / bond_capital)
+    check("capital_budget_equality", abs(capital_usage - 1), solver_options["cap_tol"])
+    check("group_capital_sum", abs(group_capital.sum() - 1), solver_options["cap_tol"])
+    check("instrument_capital_sum", abs(instrument_capital.sum() - 1), solver_options["cap_tol"])
+    for name, value in (("bond_margin_rate", margin_rate), ("bond_leverage", leverage),
+                        ("capital_used_at_floor", cap), ("non_bond_exposure", non_bond)):
+        check(f"solver_{name}_matches", abs(value - solution[name]),
+              INPUT_ABSOLUTE_TOLERANCE + INPUT_RELATIVE_TOLERANCE * abs(value))
     check("stationarity", np.max(np.abs(stationarity)), solver_options["residual_tol"])
     check("nonnegative_cap_multiplier", max(0, -cap_multiplier), solver_options["residual_tol"])
     check("complementarity", abs(cap_multiplier * (cap - 1)), solver_options["cap_tol"])
@@ -411,8 +435,10 @@ def complete_result(risk: dict, solution: dict, b: np.ndarray, h: np.ndarray,
     for j, group in enumerate(GROUP_ORDER):
         mask = A[:, j] > 0
         check(f"{group}_instrument_contributions", abs(instrument_rc[mask].sum() - group_rc[j]), consistency_tol)
+        check(f"{group}_instrument_capital", abs(instrument_capital[mask].sum() - group_capital[j]), solver_options["cap_tol"])
         result["groups"].append((group, x[j], b[j], group_shares[j], group_shares[j] - b[j],
-                                 group_mrc[j], group_rc[j], x[j] * qx[j], float(solution["budget_multipliers"][j]) if j < 3 else None))
+                                 group_mrc[j], group_rc[j], x[j] * qx[j], float(solution["budget_multipliers"][j]) if j < 3 else None,
+                                 group_capital[j]))
     if solution["status"] == "target_achieved":
         check("target_achieved", abs(volatility - target), solver_options["vol_tol"])
     else:
@@ -422,13 +448,17 @@ def complete_result(risk: dict, solution: dict, b: np.ndarray, h: np.ndarray,
     for i, code in enumerate(risk["instrument_codes"]):
         j = int(np.flatnonzero(A[i])[0])
         result["instruments"].append((code, GROUP_ORDER[j], True, A[i, j], w[i], instrument_mrc[i],
-                                      instrument_rc[i], instrument_rc[i] / volatility))
+                                      instrument_rc[i], instrument_rc[i] / volatility, instrument_capital[i]))
     if any(not r["passed"] for r in result["checks"]):
         result["status"] = "postcheck_failed"
         result["groups"], result["instruments"] = [], []
         result["error"] = "Independent validation failed; candidate positions are not valid target positions"
     result.update({"volatility": volatility, "objective": (volatility - target) ** 2,
-                   "cap_exposure": cap, "gross_exposure": float(x.sum()), "cap_multiplier": cap_multiplier})
+                   "capital_used_at_floor": cap, "gross_exposure": float(x.sum()), "cap_multiplier": cap_multiplier,
+                   "non_bond_exposure": non_bond, "bond_exposure": float(x[1]),
+                   "bond_margin_floor": margin_floor, "bond_leverage_cap": leverage_cap,
+                   "bond_margin_rate": margin_rate, "bond_leverage": leverage,
+                   "bond_capital_weight": bond_capital, "capital_usage": capital_usage})
     return result
 
 
@@ -508,16 +538,20 @@ def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
                 ("execution_status", "scheduled" if record["execution_date"] is not None else "no_execution_date"),
                 ("target_volatility", target), ("actual_volatility", result.get("volatility")),
                 ("volatility_gap", result.get("volatility", target) - target if "volatility" in result else None),
-                ("objective", result.get("objective")), ("non_bond_exposure", result.get("cap_exposure")),
+                ("objective", result.get("objective")), ("non_bond_exposure", result.get("non_bond_exposure")),
+                ("bond_leverage_cap", 1.0 / float(h[1])), ("bond_margin_floor", float(h[1])),
+                ("bond_margin_rate", result.get("bond_margin_rate")), ("bond_leverage", result.get("bond_leverage")),
+                ("bond_exposure", result.get("bond_exposure")), ("bond_capital_weight", result.get("bond_capital_weight")),
+                ("capital_used_at_floor", result.get("capital_used_at_floor")), ("capital_usage", result.get("capital_usage")),
                 ("gross_exposure", result.get("gross_exposure")), ("cap_multiplier", result.get("cap_multiplier")),
                 ("error", result.get("error", solution.get("reason", ""))),
                 ("attempt_count", len(solution.get("attempts", []))),
                 ("global_optimality_basis", solution.get("global_optimality_basis", ""))]
     _table(book, "Overview", ("field", "value"), overview)
     _table(book, "GroupResults", ("asset_class", "target_exposure", "budget", "risk_share", "budget_error",
-                                   "marginal_risk", "risk_contribution", "variance_contribution", "budget_multiplier"), result.get("groups", []))
+                                   "marginal_risk", "risk_contribution", "variance_contribution", "budget_multiplier", "capital_weight"), result.get("groups", []))
     _table(book, "InstrumentResults", ("instrument_code", "asset_class", "included", "within_class_weight",
-                                        "target_exposure", "marginal_risk", "risk_contribution", "risk_share"), result.get("instruments", []))
+                                        "target_exposure", "marginal_risk", "risk_contribution", "risk_share", "capital_weight"), result.get("instruments", []))
     attempt_rows, iteration_rows, trial_rows, matrix_rows = [], [], [], []
     for index, attempt in enumerate(solution.get("attempts", []), 1):
         branch = "active_cap" if attempt["active_cap"] else "inactive_cap"
@@ -536,7 +570,7 @@ def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
             risk_eq = x * (Q @ x) - b * sigma**2 if sigma is not None else [None] * 4
             iteration_rows.append((index, branch, row["iteration"], *x, *multipliers,
                                    row.get("volatility", sigma), row.get("objective", (sigma - target)**2 if sigma else None),
-                                   row["cap_exposure"], *shares, *risk_eq,
+                                   row["capital_used_at_floor"], *shares, *risk_eq,
                                    *row.get("stationarity", [None] * 4), row["residual_max"],
                                    row.get("step_size"), row.get("backtracks"), row.get("linear_solve_residual_max"),
                                    row.get("line_search_evaluations"), row.get("update_accepted"), row.get("termination_reason")))
@@ -559,7 +593,7 @@ def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
     _table(book, "Attempts", ("attempt", "branch", "status", "accepted", "initial_point_source",
                                "initial_x_S", "initial_x_B", "initial_x_G", "initial_x_C", "reason", "detail"), attempt_rows)
     _table(book, "Iterations", ("attempt", "branch", "iteration", *[f"x_{s}" for s in GROUP_SYMBOLS],
-                                 "mu_S", "mu_B", "mu_G", "lambda", "volatility", "objective", "non_bond_exposure",
+                                 "mu_S", "mu_B", "mu_G", "lambda", "volatility", "objective", "capital_used_at_floor",
                                  *[f"risk_share_{s}" for s in GROUP_SYMBOLS], *[f"budget_residual_{s}" for s in GROUP_SYMBOLS],
                                  *[f"stationarity_{s}" for s in GROUP_SYMBOLS], "kkt_residual_max", "step_size", "backtracks",
                                  "linear_solve_residual_max", "line_search_evaluations", "update_accepted", "termination_reason"), iteration_rows)
@@ -573,16 +607,23 @@ def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
                   ("group_order", ", ".join(GROUP_ORDER)), ("lookback_days", record["lookback"]),
                   ("rebalance_frequency", record["frequency"]), ("schedule_source_row", record["source_row"]),
                   ("target_volatility", target), ("run_date", datetime.now(timezone(timedelta(hours=8))).date()),
+                  ("bond_leverage_cap", 1.0 / float(h[1])), ("bond_margin_floor", float(h[1])),
+                  ("capital_budget", "x_S+x_G+x_C+m_B*x_B=1; m_B>=bond_margin_floor"),
+                  ("bond_margin_recovery", "m_B=(1-x_S-x_G-x_C)/x_B; bond_leverage=1/m_B"),
+                  ("capital_weight_definition", "Non-bonds: target exposure; bonds: m_B*target exposure"),
                   *[(f"budget_{g}", b[j]) for j, g in enumerate(GROUP_ORDER)],
                   *[(f"h_{g}", h[j]) for j, g in enumerate(GROUP_ORDER)],
                   *[(key, value) for key, value in solver_options.items()],
                   *[(key, value) for key, value in sources.items()],
-                  ("source_Q_policy", "Use original labelled Excel Q; read-only price reconstruction is a consistency check"),
+                  ("source_Q_policy", "Use original labelled Excel Q; price reconstruction is a consistency check"),
+                  ("source_Sigma_policy", "Use labelled InstrumentAnnualCovariance and InstrumentReturns from risk Excel; never replace with price reconstruction"),
                   ("instrument_scope", "Only the instruments in this period's saved Allocations; no synthetic future instruments"),
                   ("matrix_numbering", "KKT unknowns: x_S,x_B,x_G,x_C,mu_S,mu_B,mu_G[,lambda]; rows: stationarity then constraints")]
     if risk:
         input_rows.extend((key, value) for key, value in risk["fields"].items())
         input_rows.extend((f"source_{key}", value) for key, value in risk["metadata"].items())
+        input_rows.extend((f"class_diagnostic_{key}", value) for key, value in risk["source_diagnostics"].items())
+        input_rows.extend((f"instrument_diagnostic_{key}", value) for key, value in risk["source_instrument_diagnostics"].items())
         for key in ("source_sha256", "window_sha256", "source_price_hash_matches", "source_schedule_hash_matches"):
             input_rows.append((key, risk.get(key)))
     _table(book, "Inputs", ("field", "value"), input_rows)
@@ -590,7 +631,10 @@ def save_workbook(path: Path, record: dict, risk: Optional[dict], result: dict,
         matrices = _matrix_rows("Q_from_source_Excel", risk["Q"], list(GROUP_ORDER), list(GROUP_ORDER))
         if "Sigma" in risk:
             codes = risk["instrument_codes"]
-            matrices += _matrix_rows("Sigma_from_prices", risk["Sigma"], codes, codes)
+            matrices += _matrix_rows("Sigma_from_source_Excel", risk["Sigma"], codes, codes)
+            matrices += _matrix_rows("InstrumentAnnualVolatility", risk["instrument_annual_volatility"][:, None], codes, ["annual_volatility"])
+        matrices += _matrix_rows("AnnualVolatility", risk["annual_volatility"][:, None], list(GROUP_ORDER), ["annual_volatility"])
+        if "A" in risk:
             matrices += _matrix_rows("A", risk["A"], codes, list(GROUP_ORDER))
         _table(book, "RiskMatrices", ("matrix", "row", "column", "value"), matrices)
     if risk and "Sigma" in risk:
@@ -620,10 +664,15 @@ def _target_folder(target: float) -> str:
     return f"TargetVol_{label}pct"
 
 
+def _leverage_folder(leverage_cap: float) -> str:
+    label = format(leverage_cap, ".10g").replace(".", "p")
+    return f"BondLeverageCap_{label}x"
+
+
 def run_history(*, project_root: Path = PROJECT_ROOT, lookback_period: str = LOOKBACK_PERIOD,
                 rebalance_frequency: str = REBALANCE_FREQUENCY,
                 start_signal_date: Any = START_SIGNAL_DATE, end_signal_date: Any = END_SIGNAL_DATE,
-                targets=TARGET_VOLATILITIES, budgets=None, risk_root=None, output_root=None,
+                targets=TARGET_VOLATILITIES, leverage_caps=BOND_LEVERAGE_CAPS, budgets=None, risk_root=None, output_root=None,
                 prices_path=None, schedule_path=None, overwrite: bool = OVERWRITE_OUTPUTS,
                 failure_policy: str = FAILURE_POLICY, solver_options: Optional[dict] = None) -> dict:
     """独立运行一套窗口/频率。只读输入，每期每目标输出一个 Excel。
@@ -645,15 +694,19 @@ def run_history(*, project_root: Path = PROJECT_ROOT, lookback_period: str = LOO
         raise ValueError("Targets must be distinct, finite, positive numbers")
     if len({_target_folder(t) for t in targets}) != len(targets):
         raise ValueError("Targets would map to duplicate output folders")
+    leverage_caps = tuple(_number(value, "bond_leverage_cap") for value in leverage_caps)
+    if not leverage_caps or any(value <= 0 for value in leverage_caps) or len(set(leverage_caps)) != len(leverage_caps):
+        raise ValueError("Bond leverage caps must be distinct, finite, positive numbers")
+    if len({_leverage_folder(value) for value in leverage_caps}) != len(leverage_caps):
+        raise ValueError("Bond leverage caps would map to duplicate output folders")
+    if any(not math.isfinite(1.0 / value) or 1.0 / value <= 0 for value in leverage_caps):
+        raise ValueError("Bond leverage caps must have finite positive margin floors")
     budgets = dict(RISK_BUDGETS if budgets is None else budgets)
     if set(budgets) != set(GROUP_ORDER):
         raise ValueError("Budget labels must be the four agreed groups")
     b = np.array([_number(budgets[g], f"budget_{g}") for g in GROUP_ORDER])
     if np.any(b <= 0) or abs(b.sum() - 1) > 1e-14:
         raise ValueError("Budgets must be positive and sum to one; no renormalization")
-    if set(NON_BOND_GROUPS) != {"equity", "gold", "other_commodities"}:
-        raise ValueError("The agreed cap is on all three non-bond groups")
-    h = np.array([float(g in NON_BOND_GROUPS) for g in GROUP_ORDER])
     options = {"max_iter": MAX_ITERATIONS, "max_backtracks": MAX_BACKTRACKS,
                "residual_tol": KKT_TOLERANCE, "budget_tol": BUDGET_TOLERANCE,
                "cap_tol": CAP_TOLERANCE, "vol_tol": VOLATILITY_TOLERANCE,
@@ -693,14 +746,15 @@ def run_history(*, project_root: Path = PROJECT_ROOT, lookback_period: str = LOO
     # 运行前检查全部目的文件，防止先写了一部分才发现旧结果不能覆盖。
     for record in selected:
         for target in targets:
-            destination = output_root / folder / _target_folder(target) / f"{record['rebalance_no']:03d}.xlsx"
-            if destination.is_symlink() or (destination.exists() and (not overwrite or not destination.is_file())):
-                raise FileExistsError(f"Output already exists or is not a regular file: {destination}")
-            for parent in destination.parents:
-                if parent == output_root.parent:
-                    break
-                if parent.is_symlink():
-                    raise ValueError(f"Output path contains a symlink: {parent}")
+            for leverage_cap in leverage_caps:
+                destination = output_root / folder / _target_folder(target) / _leverage_folder(leverage_cap) / f"{record['rebalance_no']:03d}.xlsx"
+                if destination.is_symlink() or (destination.exists() and (not overwrite or not destination.is_file())):
+                    raise FileExistsError(f"Output already exists or is not a regular file: {destination}")
+                for parent in destination.parents:
+                    if parent == output_root.parent:
+                        break
+                    if parent.is_symlink():
+                        raise ValueError(f"Output path contains a symlink: {parent}")
     base_sources = {"price_source": prices_path.resolve(), "schedule_source": schedule_path.resolve(),
                     "price_sha256": prices_hash, "schedule_sha256": schedule_hash,
                     "runner_sha256": _digest(Path(__file__)), "solver_sha256": _digest(solver_path),
@@ -720,25 +774,28 @@ def run_history(*, project_root: Path = PROJECT_ROOT, lookback_period: str = LOO
             # 每期坏 ZIP/XML 等输入异常也必须留痕；不捕获用户中断。
             preparation_error = f"{type(exc).__name__}: {exc}"
         for target in targets:
-            destination = output_root / folder / _target_folder(target) / f"{record['rebalance_no']:03d}.xlsx"
-            if preparation_error is not None:
-                result = {"status": "input_invalid", "error": preparation_error, "solution": {},
-                          "groups": [], "instruments": [], "checks": [{"check": "source_input_validation", "passed": False, "detail": preparation_error}]}
-            else:
-                try:
-                    solution = solver.solve_allocation(risk["Q"], b, target, h=h, **options)
-                    result = complete_result(risk, solution, b, h, target, options)
-                except Exception as exc:
-                    result = {"status": "numerical_failure", "error": f"{type(exc).__name__}: {exc}", "solution": {}, "groups": [], "instruments": [],
-                              "checks": [{"check": "solver_exception", "passed": False, "detail": str(exc)}]}
-            save_workbook(destination, record, risk, result, b, h, target, options, sources, overwrite)
-            entry = {"rebalance_no": record["rebalance_no"], "signal_date": record["signal_date"],
-                     "target": target, "status": result["status"], "path": destination,
-                     "volatility": result.get("volatility")}
-            outcomes.append(entry)
-            print(f"{record['rebalance_no']:03d} {record['signal_date']:%Y-%m-%d} target={target:.2%} {result['status']} -> {destination.name}")
-            if result["status"] not in SUCCESS_STATUSES and failure_policy == "stop":
-                raise BatchFailure(f"Stopped after {result['status']}. Diagnostic workbook: {destination}. {result.get('error', result.get('solution', {}).get('reason', ''))}")
+            for leverage_cap in leverage_caps:
+                margin_floor = 1.0 / leverage_cap
+                h = np.array([1.0, margin_floor, 1.0, 1.0])
+                destination = output_root / folder / _target_folder(target) / _leverage_folder(leverage_cap) / f"{record['rebalance_no']:03d}.xlsx"
+                if preparation_error is not None:
+                    result = {"status": "input_invalid", "error": preparation_error, "solution": {},
+                              "groups": [], "instruments": [], "checks": [{"check": "source_input_validation", "passed": False, "detail": preparation_error}]}
+                else:
+                    try:
+                        solution = solver.solve_allocation(risk["Q"], b, target, bond_margin_floor=margin_floor, **options)
+                        result = complete_result(risk, solution, b, h, target, options)
+                    except Exception as exc:
+                        result = {"status": "numerical_failure", "error": f"{type(exc).__name__}: {exc}", "solution": {}, "groups": [], "instruments": [],
+                                  "checks": [{"check": "solver_exception", "passed": False, "detail": str(exc)}]}
+                save_workbook(destination, record, risk, result, b, h, target, options, sources, overwrite)
+                entry = {"rebalance_no": record["rebalance_no"], "signal_date": record["signal_date"],
+                         "target": target, "bond_leverage_cap": leverage_cap, "bond_margin_floor": margin_floor, "status": result["status"], "path": destination,
+                         "volatility": result.get("volatility")}
+                outcomes.append(entry)
+                print(f"{record['rebalance_no']:03d} {record['signal_date']:%Y-%m-%d} target={target:.2%} bond_leverage_cap={leverage_cap:g}x {result['status']} -> {destination.name}")
+                if result["status"] not in SUCCESS_STATUSES and failure_policy == "stop":
+                    raise BatchFailure(f"Stopped after {result['status']}. Diagnostic workbook: {destination}. {result.get('error', result.get('solution', {}).get('reason', ''))}")
     failed = sum(r["status"] not in SUCCESS_STATUSES for r in outcomes)
     return {"status": "partial_failure" if failed else "completed", "failed": failed,
             "periods": len(selected), "outcomes": outcomes, "output_directory": output_root / folder}
@@ -752,6 +809,8 @@ def _main(argv=None) -> int:
     parser.add_argument("--start-signal-date", default=START_SIGNAL_DATE)
     parser.add_argument("--end-signal-date", default=END_SIGNAL_DATE)
     parser.add_argument("--targets", nargs="+", type=float, default=TARGET_VOLATILITIES)
+    parser.add_argument("--bond-leverage-caps", nargs="+", type=float, default=BOND_LEVERAGE_CAPS,
+                        help="Bond exposure/capital limits; margin floors are their reciprocals")
     parser.add_argument("--risk-root", type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--prices", type=Path)
@@ -763,7 +822,8 @@ def _main(argv=None) -> int:
     try:
         result = run_history(project_root=args.project_root, lookback_period=args.lookback_period,
                              rebalance_frequency=args.frequency, start_signal_date=args.start_signal_date,
-                             end_signal_date=args.end_signal_date, targets=args.targets, risk_root=args.risk_root,
+                             end_signal_date=args.end_signal_date, targets=args.targets,
+                             leverage_caps=args.bond_leverage_caps, risk_root=args.risk_root,
                              output_root=args.output_root, prices_path=args.prices, schedule_path=args.schedule,
                              overwrite=args.overwrite, failure_policy=args.failure_policy,
                              solver_options={"trace_level": args.trace_level})
