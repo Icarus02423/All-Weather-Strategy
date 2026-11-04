@@ -16,6 +16,13 @@ def figure_paths(output_dir, mode="next_day_close"):
     return [Path(output_dir) / f"{mode}_{suffix}.png" for suffix in SUFFIXES]
 
 
+def comparison_figure_paths(output_dir, targets):
+    paths = []
+    for target in sorted(set(targets)):
+        percent = float(target) * 100
+        label = f"{int(percent):02d}" if percent.is_integer() else format(percent, ".10g").replace(".", "p")
+        paths.extend(Path(output_dir) / f"TargetVol_{label}pct_comparison_{kind}.png" for kind in ("cumulative_nav", "drawdown"))
+    return paths
 
 
 def _check_destination(path, overwrite):
@@ -304,3 +311,29 @@ def save_figures(output_dir, result, *, mode="next_day_close", overwrite=False):
     return paths
 
 
+def save_comparison_figures(output_dir, results_by_scenario, *, overwrite=False):
+    targets = sorted({key[0] for key in results_by_scenario})
+    paths = comparison_figure_paths(output_dir, targets)
+    for path in paths:
+        _check_destination(path, overwrite)
+    if not results_by_scenario:
+        raise ValueError("No target results to compare")
+    with _plot_context() as (plt, mdates, PercentFormatter):
+        for index, target in enumerate(targets):
+            cases = sorted(((key[1], value) for key, value in results_by_scenario.items() if key[0] == target), reverse=True)
+            for kind, path in zip(("nav", "drawdown"), paths[index * 2:index * 2 + 2]):
+                figure, axis = plt.subplots(figsize=(10.0, 4.8), facecolor="white")
+                for i, (limit, result) in enumerate(cases):
+                    daily, summary = result["daily_nav"], result["summary"]
+                    dates = [pd.Timestamp(summary["baseline_date"]), *pd.to_datetime(daily["date"])]
+                    values = [1., *daily["normalized_nav"]] if kind == "nav" else [0., *daily["drawdown"]]
+                    axis.plot(dates, values, color=COLORS[i % len(COLORS)], linewidth=1.5, label=f"国债上限 {limit:g}倍")
+                benchmark_values = [1., *daily["benchmark_nav"]] if kind == "nav" else [0., *daily["benchmark_drawdown"]]
+                axis.plot(dates, benchmark_values, color="#777777", linestyle="--", label="沪深300全收益")
+                if kind == "drawdown":
+                    axis.yaxis.set_major_formatter(PercentFormatter(1.0))
+                axis.set_ylabel("归一化累计净值" if kind == "nav" else "回撤")
+                _style(axis, f"目标波动率 {target * 100:g}%：国债杠杆上限对比")
+                _date_axis(axis, mdates)
+                _save(figure, path, plt, overwrite)
+    return paths
