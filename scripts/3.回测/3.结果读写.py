@@ -1,3 +1,8 @@
+"""读取已验收的逐期优化 Excel，导出回测及目标波动率比较 Excel。
+
+Python 3.9+；只用 numpy/pandas/openpyxl。导入不读写，不改仓位、不生成 JSON。
+未定义统计量保存为文字 N/A；图表将其视为缺失，不伪造为零。
+"""
 from __future__ import annotations
 
 import hashlib
@@ -121,6 +126,7 @@ def _input(values: dict, name: str, kind: str = "number", nullable: bool = False
 
 
 def read_optimization(path: Path, expected: dict, target: float, prices=None, *, leverage_cap: float) -> dict:
+    """读取一个原始调仓结果；失败、缺字段、冲突、非有限值均拒绝。"""
     path = Path(path)
     target = _number(target, "target", True)
     leverage_cap = _number(leverage_cap, "bond_leverage_cap", True)
@@ -415,6 +421,7 @@ def _missing(value):
 
 
 def style_worksheet(sheet, percent_headers=None, decimal_headers=None, integer_headers=None, max_width=28):
+    """复用 ETF：Arial、4472C4 蓝表头、灰边框、A2 冻结、筛选、隐藏网格。"""
     percent_headers, decimal_headers, integer_headers = set(percent_headers or ()), set(decimal_headers or ()), set(integer_headers or ())
     thin_gray = Side(style="thin", color="D9D9D9")
     border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
@@ -879,6 +886,7 @@ def _details_book(result, inputs, sources):
 
 
 def save_backtest_reports(output_dir, result, inputs, sources, *, mode="next_day_close", overwrite=False) -> list[Path]:
+    """按 ETF 布局输出五个独立 Excel，含基准和整体国债资金；容量留空。"""
     paths = report_paths(output_dir, mode)
     for path in paths:
         _validate_destination(path, overwrite)
@@ -898,6 +906,7 @@ def save_backtest_reports(output_dir, result, inputs, sources, *, mode="next_day
 
 
 def save_comparison(path, results_by_scenario, inputs, overwrite=False):
+    """每行一个目标波动率/杠杆上限组合，另列共同基准、净值和回撤。"""
     _validate_destination(Path(path), overwrite)
     if not results_by_scenario:
         raise ValueError("No backtest results to compare")
