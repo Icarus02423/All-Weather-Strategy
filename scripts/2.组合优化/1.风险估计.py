@@ -442,6 +442,7 @@ def _risk_column_format(sheet: str, column: str, value: Any) -> str:
         or "volatility" in name
         or name.endswith("_vol")
         or (sheet == "ClassReturns" and name in assets)
+        or (sheet == "InstrumentReturns" and name != "return_date")
     ):
         return "0.0000%"
     if "eigenvalue" in name or "tolerance" in name:
@@ -451,7 +452,8 @@ def _risk_column_format(sheet: str, column: str, value: Any) -> str:
 
 def _validate_output_tables(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Validate the full batch before any per-period filtering or writing."""
-    expected = ("Overview", "Covariance", "Allocations", "ClassReturns")
+    expected = ("Overview", "Covariance", "Allocations", "ClassReturns",
+                "InstrumentCovariance", "InstrumentReturns")
     if set(tables) != set(expected):
         raise ValueError(f"Output tables must contain exactly {expected}.")
     identity_columns = (
@@ -508,7 +510,8 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
     overview = _validate_output_tables(tables)
     if len(overview) != 1:
         raise ValueError("Each workbook must contain exactly one rebalance.")
-    expected = ("Overview", "Covariance", "Allocations", "ClassReturns")
+    expected = ("Overview", "Covariance", "Allocations", "ClassReturns",
+                "InstrumentCovariance", "InstrumentReturns")
     identity_columns = (
         "rebalance_no", "signal_date", "lookback_period", "lookback_days",
         "rebalance_frequency",
@@ -530,7 +533,7 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
         "n_returns", "risk_status", "execution_status", "run_date",
     )
     volatility_fields = tuple(f"{asset}_volatility" for asset in ASSET_CLASSES)
-    required_overview = set(left_fields + right_fields + volatility_fields)
+    required_overview = set(left_fields + right_fields + volatility_fields + ("data_version",))
     if not required_overview.issubset(overview.columns):
         raise ValueError("Overview is missing required period or volatility fields.")
 
@@ -547,15 +550,15 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
 
     def write_table(worksheet: Any, title_row: int, title: str,
                     columns: tuple[str, ...], records: list[tuple],
-                    section: str) -> tuple[int, int]:
-        put(worksheet, title_row, 1, title, section, "section")
+                    section: str, start_column: int = 1) -> tuple[int, int]:
+        put(worksheet, title_row, start_column, title, section, "section")
         header_row = title_row + 1
         if header_row + len(records) > 1_048_576:
             raise ValueError(f"{worksheet.title}.{title} exceeds the Excel row limit.")
-        for column_number, column in enumerate(columns, start=1):
+        for column_number, column in enumerate(columns, start=start_column):
             put(worksheet, header_row, column_number, column, section, column)
         for row_number, record in enumerate(records, start=header_row + 1):
-            for column_number, (column, value) in enumerate(zip(columns, record), start=1):
+            for column_number, (column, value) in enumerate(zip(columns, record), start=start_column):
                 put(worksheet, row_number, column_number, value, section, column)
         return header_row, header_row + len(records)
 
@@ -577,6 +580,26 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
             covariance = covariance.set_index("asset_class").loc[list(ASSET_CLASSES)]
             if len(parts["ClassReturns"]) != period["n_returns"]:
                 raise ValueError(f"Rebalance {number}: return row count differs from n_returns.")
+            codes = tuple(parts["Allocations"]["instrument_code"])
+            instrument_covariance = parts["InstrumentCovariance"].pivot(
+                index="instrument_code", columns="other_instrument_code", values="covariance",
+            )
+            instrument_returns = parts["InstrumentReturns"].pivot(
+                index="return_date", columns="instrument_code", values="return",
+            ).sort_index()
+            if (len(set(codes)) != len(codes)
+                    or set(instrument_covariance.index) != set(codes)
+                    or set(instrument_covariance.columns) != set(codes)
+                    or set(instrument_returns.columns) != set(codes)):
+                raise ValueError(f"Rebalance {number}: instrument tables differ from Allocations.")
+            instrument_covariance = instrument_covariance.loc[list(codes), list(codes)]
+            instrument_returns = instrument_returns.loc[:, list(codes)]
+            if (len(instrument_returns) != period["n_returns"]
+                    or not pd.DatetimeIndex(instrument_returns.index).equals(
+                        pd.DatetimeIndex(parts["ClassReturns"]["return_date"].sort_values()))
+                    or not np.isfinite(instrument_covariance.to_numpy(dtype=float)).all()
+                    or not np.isfinite(instrument_returns.to_numpy(dtype=float)).all()):
+                raise ValueError(f"Rebalance {number}: instrument observations are incomplete or misaligned.")
 
             worksheet = workbook.create_sheet(f"Rebalance_{number:03d}")
             worksheet.sheet_view.showGridLines = True
@@ -586,6 +609,8 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
                 for row_number, field in enumerate(fields, start=3):
                     put(worksheet, row_number, column, field, "Overview", "field")
                     put(worksheet, row_number, column + 1, period[field], "Overview", field)
+            put(worksheet, 3, 7, "data_version", "Overview", "field")
+            put(worksheet, 3, 8, period["data_version"], "Overview", "data_version")
 
             covariance_records = [
                 (asset, *(covariance.loc[asset, other] for other in ASSET_CLASSES))
@@ -620,24 +645,69 @@ def _write_risk_workbook(tables: dict[str, pd.DataFrame], destination: Path) -> 
                 worksheet, allocation_end + 2, "ClassReturns", return_columns,
                 return_records, "ClassReturns",
             )
-            accounted_for = set(left_fields + right_fields + volatility_fields)
+            accounted_for = set(left_fields + right_fields + volatility_fields + ("data_version",))
             diagnostic_fields = [field for field in overview.columns if field not in accounted_for]
             if diagnostic_fields:
                 # Preserve Overview fields as explicit field/value pairs. Values
                 # keep their field-specific number formats, unlike a generic table.
-                diagnostic_start = return_end + 2
-                put(worksheet, diagnostic_start, 1, "Diagnostics", "Overview", "section")
-                put(worksheet, diagnostic_start + 1, 1, "field", "Overview", "field")
-                put(worksheet, diagnostic_start + 1, 2, "value", "Overview", "field")
+                diagnostic_start = 22
+                put(worksheet, diagnostic_start, 7, "Diagnostics", "Overview", "section")
+                put(worksheet, diagnostic_start + 1, 7, "field", "Overview", "field")
+                put(worksheet, diagnostic_start + 1, 8, "value", "Overview", "field")
                 for row_number, field in enumerate(diagnostic_fields, start=diagnostic_start + 2):
-                    put(worksheet, row_number, 1, field, "Overview", "field")
-                    put(worksheet, row_number, 2, period[field], "Overview", field)
+                    put(worksheet, row_number, 7, field, "Overview", "field")
+                    put(worksheet, row_number, 8, period[field], "Overview", field)
+
+            write_table(
+                worksheet, 14, "InstrumentAnnualCovariance", ("instrument_code", *codes),
+                [(code, *instrument_covariance.loc[code].tolist()) for code in codes],
+                "InstrumentCovariance", start_column=10,
+            )
+            write_table(
+                worksheet, return_header - 1, "InstrumentReturns", ("return_date", *codes),
+                [(day, *values) for day, values in zip(instrument_returns.index, instrument_returns.to_numpy())],
+                "InstrumentReturns", start_column=10,
+            )
+
+            # These are descriptions of the existing instrument covariance;
+            # no matrix repair or additional portfolio constraints are applied.
+            matrix = instrument_covariance.to_numpy(dtype=float)
+            variances = np.diag(matrix)
+            if np.any(variances < 0):
+                raise ValueError(f"Rebalance {number}: instrument variance cannot be negative.")
+            instrument_volatility = np.sqrt(variances)
+            eigenvalues = np.linalg.eigvalsh(matrix)
+            rank = int(np.linalg.matrix_rank(matrix))
+            condition = float(np.linalg.cond(matrix)) if rank == len(codes) else float("inf")
+            statistics_column = len(codes) + 12
+            _, volatility_end = write_table(
+                worksheet, 14, "InstrumentAnnualVolatility", ("instrument_code", "annual_volatility"),
+                list(zip(codes, instrument_volatility)), "InstrumentVolatility",
+                start_column=statistics_column,
+            )
+            diagnostic_start = volatility_end + 2
+            put(worksheet, diagnostic_start, statistics_column,
+                "InstrumentDiagnostics", "InstrumentDiagnostics", "section")
+            put(worksheet, diagnostic_start + 1, statistics_column, "field", "InstrumentDiagnostics", "field")
+            put(worksheet, diagnostic_start + 1, statistics_column + 1, "value", "InstrumentDiagnostics", "field")
+            for row_number, (field, value) in enumerate((
+                ("covariance_rank", rank), ("condition_number", condition),
+                ("minimum_eigenvalue", float(eigenvalues[0])),
+            ), start=diagnostic_start + 2):
+                put(worksheet, row_number, statistics_column, field, "InstrumentDiagnostics", "field")
+                put(worksheet, row_number, statistics_column + 1, value, "InstrumentDiagnostics", field)
 
             # A single regular filter belongs to the daily return table; other
             # sections are independent tables and are deliberately outside it.
             worksheet.auto_filter.ref = f"A{return_header}:E{return_end}"
             for column_number, width in enumerate((28, 22, 24, 25, 22, 3, 26, 22), start=1):
                 worksheet.column_dimensions[get_column_letter(column_number)].width = width
+            worksheet.column_dimensions["I"].width = 3
+            for column_number in range(10, len(codes) + 11):
+                worksheet.column_dimensions[get_column_letter(column_number)].width = 22
+            worksheet.column_dimensions[get_column_letter(statistics_column - 1)].width = 3
+            worksheet.column_dimensions[get_column_letter(statistics_column)].width = 30
+            worksheet.column_dimensions[get_column_letter(statistics_column + 1)].width = 22
             worksheet.sheet_properties.pageSetUpPr.fitToPage = False
         workbook.save(destination)
     finally:
@@ -805,6 +875,7 @@ def build_output_tables(
     if len(scheme) != 1:
         raise ValueError("One export batch must contain exactly one parameter scheme.")
     overview, covariance, allocations, returns = [], [], [], []
+    instrument_covariance, instrument_returns = [], []
     keys = ("rebalance_no", "signal_date", "lookback_period", "lookback_days", "rebalance_frequency")
     seen = set()
     for result in results:
@@ -838,11 +909,23 @@ def build_output_tables(
                 allocations.append({**identity, "asset_class": asset, "instrument_code": code, "within_class_weight": weight})
         for day, values in result["class_returns"].iterrows():
             returns.append({**identity, "return_date": day, **{asset: float(values[asset]) for asset in ASSET_CLASSES}})
+        for code, values in result["instrument_covariance"].iterrows():
+            for other, value in values.items():
+                instrument_covariance.append({**identity, "instrument_code": code,
+                                              "other_instrument_code": other, "covariance": float(value)})
+        for day, values in result["instrument_returns"].iterrows():
+            for code, value in values.items():
+                instrument_returns.append({**identity, "return_date": day,
+                                           "instrument_code": code, "return": float(value)})
     tables = {
         "Overview": pd.DataFrame(overview),
         "Covariance": pd.DataFrame(covariance, columns=[*keys, "asset_class", *ASSET_CLASSES]),
         "Allocations": pd.DataFrame(allocations, columns=[*keys, "asset_class", "instrument_code", "within_class_weight"]),
         "ClassReturns": pd.DataFrame(returns, columns=[*keys, "return_date", *ASSET_CLASSES]),
+        "InstrumentCovariance": pd.DataFrame(instrument_covariance, columns=[
+            *keys, "instrument_code", "other_instrument_code", "covariance"]),
+        "InstrumentReturns": pd.DataFrame(instrument_returns, columns=[
+            *keys, "return_date", "instrument_code", "return"]),
     }
     tables["Overview"].attrs["run_metadata"] = metadata
     return tables
