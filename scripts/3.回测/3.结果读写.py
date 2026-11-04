@@ -368,59 +368,586 @@ FUNDING_DECIMAL = {FUNDING_COLUMNS[k] for k in ("bond_leverage_cap", "bond_notio
                    "bond_leverage_before_trade", "capital_shortfall_before_trade")}
 
 
+def _funding_values(record):
+    labels = {"not_invested": "尚未建仓", "within_limit": "满足下限", "below_floor": "低于下限",
+              "bond_capital_depleted": "国债资金耗尽"}
+    values = []
+    for key in FUNDING_COLUMNS:
+        value = record.get(key)
+        if isinstance(value, (bool, np.bool_)):
+            value = "是" if value else "否"
+        elif key == "funding_state":
+            value = labels.get(value, value)
+        values.append(value)
+    return values
 ANNUAL_HEADERS = ["年份", "策略收益", "基准收益", "超额收益", "年化波动", "跟踪误差", "Sharpe", "Sortino",
                   "信息比率", "策略最大回撤", "基准最大回撤", "超额最大回撤", "Calmar", "年化换手率（单边）"]
 
 
+def _scalar(value: Any):
+    if value is _BLANK:
+        return None
+    if value is None or value is pd.NA or value is pd.NaT:
+        return "N/A"
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, pd.Timestamp):
+        if value.tzinfo is not None:
+            raise ValueError("Excel dates must be timezone-naive")
+        return value.to_pydatetime()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "N/A"
+        if not math.isfinite(value):
+            raise ValueError("Cannot export infinite numeric values")
+        return value
+    if isinstance(value, (str, bool, int, datetime, date)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return "、".join(str(v) for v in value)
+    raise TypeError(f"Unsupported Excel value: {type(value).__name__}")
 
 
+def _missing(value):
+    return value is None or value is pd.NA or value is pd.NaT or (isinstance(value, (float, np.floating)) and math.isnan(float(value)))
 
 
+def style_worksheet(sheet, percent_headers=None, decimal_headers=None, integer_headers=None, max_width=28):
+    percent_headers, decimal_headers, integer_headers = set(percent_headers or ()), set(decimal_headers or ()), set(integer_headers or ())
+    thin_gray = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    sheet.freeze_panes = "A2"
+    sheet.sheet_view.showGridLines = False
+    sheet.auto_filter.ref = sheet.dimensions
+    for cell in sheet[1]:
+        cell.fill = PatternFill("solid", fgColor="4472C4")
+        cell.font = Font(name="Arial", size=11, color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    sheet.row_dimensions[1].height = 24
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    for names, number_format in ((percent_headers, "0.00%"), (decimal_headers, "0.000000"), (integer_headers, "#,##0")):
+        for header in names:
+            if header in headers:
+                for row in range(2, sheet.max_row + 1):
+                    sheet.cell(row, headers[header]).number_format = number_format
+    for column_number in range(1, sheet.max_column + 1):
+        values = [sheet.cell(row, column_number).value for row in range(1, min(sheet.max_row, 300) + 1)]
+        width = min(max((len(str(v)) for v in values if v is not None), default=10) + 2, max_width)
+        sheet.column_dimensions[get_column_letter(column_number)].width = max(width, 11)
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = Font(name="Arial", size=10)
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center" if isinstance(cell.value, str) else "right", vertical="center")
+            if isinstance(cell.value, (datetime, date)):
+                cell.number_format = "yyyy-mm-dd"
 
 
+def _table(book, name, headers, records, *, percent=(), decimal=(), integer=(), max_width=28):
+    headers = list(headers)
+    if not headers or len(set(headers)) != len(headers) or any(not isinstance(h, str) or not h for h in headers):
+        raise ValueError(f"Invalid headers for {name}")
+    if len(headers) > 16384:
+        raise ValueError(f"{name} exceeds Excel column limit")
+    ws = book.create_sheet(name)
+    ws.append(headers)
+    count = 0
+    for record in records:
+        values = list(record)
+        if len(values) != len(headers):
+            raise ValueError(f"Row length mismatch in {name}")
+        count += 1
+        if count > 1048575:
+            raise ValueError(f"{name} exceeds Excel row limit")
+        ws.append([_scalar(v) for v in values])
+    for row in ws:
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"  # 包括以 = 开头的路径/说明；禁止作为 Excel 公式执行。
+    style_worksheet(ws, percent, decimal, integer, max_width)
+    return ws
 
 
+def _new_book():
+    book = Workbook()
+    book.remove(book.active)
+    return book
 
 
+def _validate_destination(path: Path, overwrite: bool):
+    if not isinstance(overwrite, bool):
+        raise TypeError("overwrite must be bool")
+    if path.suffix.lower() != ".xlsx":
+        raise ValueError("Output must use .xlsx")
+    for component in (path, *path.absolute().parents):
+        if component.is_symlink():
+            raise ValueError(f"Refusing symbolic-link output path: {component}")
+    if path.exists() and (not overwrite or not path.is_file()):
+        raise FileExistsError(f"Output already exists or is not a file: {path}")
 
 
+def _save(book, path, overwrite):
+    path, temporary = Path(path), None
+    try:
+        _validate_destination(path, overwrite)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".backtest-", suffix=".xlsx", dir=path.parent)
+        os.close(fd)
+        book.save(temporary)
+        _validate_destination(path, overwrite)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    finally:
+        book.close()
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
+def report_paths(output_dir, mode="next_day_close") -> list[Path]:
+    if not isinstance(mode, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", mode):
+        raise ValueError("Invalid execution mode filename")
+    root = Path(output_dir)
+    return [root / f"{mode}_{suffix}.xlsx" for suffix in
+            ("annual_metrics", "backtest_metrics", "holdings", "time_series", "account_details")]
 
 
+def _frame(result, key, required=()):
+    frame = result[key]
+    if not isinstance(frame, pd.DataFrame) or frame.columns.has_duplicates:
+        raise ValueError(f"{key} must be a DataFrame with unique columns")
+    if len(frame) and not set(required).issubset(frame.columns):
+        raise ValueError(f"Missing required {key} columns: {sorted(set(required) - set(frame.columns))}")
+    return frame
 
 
+def _nav_column(frame):
+    for column in ("normalized_nav", "net_nav", "nav"):
+        if column in frame:
+            return column
+    raise ValueError("Daily NAV is missing")
 
 
+def _date_text(value):
+    return None if _missing(value) else _date(value, "report date").strftime("%Y-%m-%d")
 
 
+def _drawdown_range(summary):
+    start, end = summary.get("max_drawdown_start"), summary.get("max_drawdown_end")
+    if _missing(start) or _missing(end):
+        return None
+    return f"{_date(start, 'drawdown start'):%Y年%m月}-{_date(end, 'drawdown end'):%Y年%m月}"
 
 
+def _value(record, *keys):
+    for key in keys:
+        if key in record:
+            return record[key]
+    return None
 
 
+def _performance_rows(result):
+    s = result["summary"]
+    signals = _frame(result, "signals")
+    attempted = int((signals["backtest_action"] == "executed").sum()) if "backtest_action" in signals else 0
+    success_rate = s.get("rebalance_count", 0) / attempted if attempted else None
+    return [
+        ["基本信息", "回测区间", f"{_date_text(s['start_date'])}至{_date_text(s['end_date'])}"],
+        ["基本信息", "交易日数量", s.get("observations")],
+        ["基本信息", "初始净值", 1.0],
+        ["基本信息", "期末净值", s["final_nav"] / s["initial_nav"]],
+        ["基本信息", "累计收益率", s.get("total_return")],
+        ["收益表现", "策略年化收益率", s.get("annualized_return")],
+        ["收益表现", "基准年化收益率", s.get("benchmark_annualized_return")],
+        ["收益表现", "年化超额收益", s.get("annualized_excess_return")],
+        ["收益表现", "基准年化波动率", s.get("benchmark_annualized_volatility")],
+        ["收益表现", "基准最大回撤", s.get("benchmark_max_drawdown")],
+        ["绝对风险收益", "策略年化波动率", s.get("annualized_volatility")],
+        ["绝对风险收益", "Sharpe", s.get("sharpe_ratio")],
+        ["绝对风险收益", "Sortino", s.get("sortino_ratio")],
+        ["绝对风险收益", "策略最大回撤", s.get("max_drawdown")],
+        ["绝对风险收益", "策略最大回撤区间", _drawdown_range(s)],
+        ["绝对风险收益", "Calmar", s.get("calmar_ratio")],
+        ["相对基准表现", "年化跟踪误差", s.get("tracking_error")],
+        ["相对基准表现", "IR", s.get("information_ratio")],
+        ["相对基准表现", "超额最大回撤", s.get("excess_max_drawdown")],
+        ["相对基准表现", "超额最大回撤区间", _drawdown_range({"max_drawdown_start": s.get("excess_max_drawdown_start"), "max_drawdown_end": s.get("excess_max_drawdown_end")})],
+        ["交易与组合", "年化换手率（单边）", s.get("annualized_one_way_turnover")],
+        ["交易与组合", "平均每日换仓比率（单边）", s.get("mean_one_way_turnover")],
+        ["交易与组合", "累计交易成本率", s.get("cumulative_cost_rate")],
+        ["交易与组合", "平均持仓品种数量", s.get("average_holding_count")],
+        ["交易与组合", "调仓次数", s.get("rebalance_count")],
+        ["交易与组合", "调仓成功率", success_rate],
+        ["资金约束", "国债杠杆上限", s.get("bond_leverage_cap")],
+        ["资金约束", "最低保证金率", s.get("bond_margin_floor")],
+        ["资金约束", "平均收盘国债保证金率", s.get("mean_bond_margin_rate")],
+        ["资金约束", "最低观察国债保证金率", s.get("minimum_bond_margin_rate")],
+        ["资金约束", "最高观察国债杠杆", s.get("maximum_bond_leverage")],
+        ["资金约束", "约束越界天数", s.get("margin_breach_days")],
+        ["资金约束", "国债资金耗尽天数", s.get("bond_capital_depleted_days")],
+        ["资金约束", "最大国债资金缺口", s.get("max_capital_shortfall")],
+        ["资金约束", "资金约束状态", s.get("capital_constraint_status")],
+        ["优化状态", "达到目标波动次数", s.get("target_achieved_count")],
+        ["优化状态", "资金约束限制次数", s.get("cap_limited_count")],
+    ]
 
 
+def _style_performance(ws):
+    percentages = {"累计收益率", "策略年化收益率", "基准年化收益率", "年化超额收益", "策略年化波动率",
+                   "策略最大回撤", "年化跟踪误差", "超额最大回撤", "平均每日换仓比率（单边）", "累计交易成本率", "调仓成功率",
+                   "基准年化波动率", "基准最大回撤", "最低保证金率", "平均收盘国债保证金率", "最低观察国债保证金率"}
+    for row in ws.iter_rows(min_row=2):
+        metric = row[1].value
+        if metric in percentages:
+            fmt = "0.00%"
+        elif metric in {"年化换手率（单边）", "国债杠杆上限", "最高观察国债杠杆"}:
+            fmt = '0.00"倍"'
+        elif metric in {"交易日数量", "约束越界天数", "国债资金耗尽天数"}:
+            fmt = '0"天"'
+        elif metric in {"调仓次数", "达到目标波动次数", "资金约束限制次数"}:
+            fmt = '0"次"'
+        elif metric == "平均持仓品种数量":
+            fmt = '0.00"种"'
+        elif metric in {"初始净值", "期末净值", "Sharpe", "Sortino", "Calmar", "IR"}:
+            fmt = "0.0000"
+        else:
+            fmt = "General"
+        for cell in row[2:]:
+            cell.number_format = fmt
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 34
+    for index in range(3, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(index)].width = 28
 
 
+def _parameter_rows(inputs, summary=None, mode="next_day_close"):
+    s = summary or {}
+    value = lambda key, default=None: inputs.get(key, s.get(key, default))
+    rows = [
+        ["基本信息", "执行价格", "下一交易日收盘价" if mode == "next_day_close" else mode],
+        ["基本信息", "风险估计回看日数", value("lookback_days")],
+        ["基本信息", "调仓频率", {"monthly": "月度", "quarterly": "季度", "semiannual": "半年度"}.get(value("rebalance_frequency"), value("rebalance_frequency"))],
+        ["基本信息", "目标年化波动率", value("target_volatility", value("targets"))],
+        ["基准设置", "基准名称", value("benchmark_name", "沪深300全收益指数")],
+        ["基准设置", "基准代码", value("benchmark_code", "H00300.CSI")],
+        ["基准设置", "基准相关指标", "共同基线和日期；不填充、不截短区间；超额净值=策略净值/基准净值"],
+        ["基准设置", "超额指标口径", "主动日收益=策略日收益−基准日收益；年化超额收益=两者年化收益之差；超额回撤来自净值比值"],
+        ["基准设置", "净值图起点", 1.0],
+        ["基准设置", "净值标准化", "报告累计净值=组合净资产÷初始资金，从1起；账户净资产仍按初始资金记账；基线行不计入收益统计"],
+        ["基准设置", "基线日期", s.get("baseline_date")],
+        ["基准设置", "基线日期口径", "取回测首日前最近观察日，仅表示初始账户状态" if s.get("baseline_date_is_observed", True)
+         else "无前序行情，使用前一自然日作为初始账户标记；该日不是行情观测"],
+        ["组合约束", "目标仓位来源", "逐期优化文件的品种目标名义敞口；不重新优化、不归一化"],
+        ["组合约束", "资产组", "股票、债券、黄金、其他商品"],
+        ["组合约束", "组内分配", "继承当期优化名单和组内等名义敞口分配"],
+        ["组合约束", "国债杠杆上限", value("bond_leverage_cap", value("leverage_caps"))],
+        ["组合约束", "最低保证金率", value("bond_margin_floor")],
+        ["组合约束", "调仓资金约束", "非债敞口+m_B×国债敞口=1；m_B不低于设定下限"],
+        ["组合约束", "持有期间越界处理", "每日收盘记录交易前后资金；越界只标记，不触发额外减仓或强平"],
+        ["账户结构", "账户模型", "国债资金=组合净资产−非债名义金额；保证金率=国债资金/国债名义金额"],
+        ["账户结构", "资金耗尽显示", "国债资金不为正时杠杆为N/A；记录资金耗尽，结果不视为全程满足下限"],
+        ["账户结构", "持仓单位", "加权价格序列的合成单位；不是实际期货合约手数"],
+        ["交易设置", "初始资金", value("initial_nav", 1.0)],
+        ["交易设置", "初始持仓", "回测开始时空仓；不承接开始日前的持仓"],
+        ["交易设置", "成交时点", "信号日后下一观察日收盘调仓；旧仓取得执行日收益，新仓从后一观察日起计收益"],
+        ["交易设置", "持仓期间", "固定合成单位数，名义敞口自然漂移，不每日再平衡"],
+        ["交易设置", "样本末处理", "按最后收盘价估值，不强制平仓；无执行日期的信号不下单"],
+        ["交易成本", "单边手续费（基点）", value("fee_bps", 0.0)],
+        ["交易成本", "单边滑点（基点）", value("slippage_bps", 0.0)],
+        ["交易成本", "费用计算", "买卖名义金额绝对值×费率；目标名义敞口以扣费后的净资产为分母"],
+        ["交易成本", "单边换手率", "买卖名义金额绝对值合计÷调仓前扣费前净资产÷2"],
+        ["交易成本", "年度及平均换手", "排除首次建仓日；平均值以其余观察日为分母，年度值按交易日数年化"],
+        ["交易成本", "累计成本率", "1−逐日连乘(1−当日交易成本÷当日扣费前净资产)"],
+        ["收益参数", "年化交易日", value("annualization", 252)],
+        ["收益参数", "年化无风险利率", value("risk_free_rate_for_sharpe", 0.0)],
+        ["收益参数", "无风险利率用途", "仅用于 Sharpe 和 Sortino，不计入账户收益"],
+        ["收益参数", "滚动波动窗口", value("rolling_window", 63)],
+        ["收益口径", "每日收益", "前日净资产加原持仓盈亏，减手续费及滑点；首次建仓成本计入当日收益"],
+        ["收益口径", "年化收益", "(期末净资产÷初始资金)^(年化交易日÷观察日数)−1"],
+        ["收益口径", "年化波动", "简单日收益样本标准差(ddof=1)×年化交易日平方根"],
+        ["收益口径", "累计归因", "各组或品种累计盈亏减费用后除以初始资金；不单独复利每日贡献"],
+        ["容量设置", "策略容量", "未估计；现有输入无成交额、实际合约及保证金数据，容量列留空"],
+        ["数据口径", "行情", "同花顺 iFinD 加权期货日收盘价；用于价格序列敞口回测"],
+        ["数据口径", "未模拟项目", "真实合约换月、合约乘数、整数手数、逐合约交易所保证金及强制平仓"],
+        ["数据口径", "缺失价格", "持有或交易涉及的价格缺失时报错；不填充、不自动缩短区间"],
+        ["输出口径", "未定义指标", "N/A；未估计容量以及基线收益为真正空白"],
+    ]
+    for key, label in (("price_source", "价格文件"), ("schedule_source", "调仓安排"), ("optimization_root", "优化结果目录"), ("benchmark_source", "基准文件")):
+        if key in inputs:
+            rows.append(["数据来源", label, inputs[key]])
+    # 品种名称是持仓表的映射，不把整个字典挤进参数单元格。
+    return rows
 
 
+def _write_parameters(book, inputs, summary=None, mode="next_day_close", sheet="parameters"):
+    ws = _table(book, sheet, ["类别", "参数 / 约束", "本项目设置"], _parameter_rows(inputs, summary, mode), max_width=50)
+    for row in ws.iter_rows(min_row=2):
+        if row[1].value in {"目标年化波动率", "年化无风险利率", "最低保证金率"}:
+            row[2].number_format = "0.00%"
+        if isinstance(row[2].value, str):
+            row[2].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            width = sum(2 if ord(c) > 127 else 1 for c in row[2].value)
+            ws.row_dimensions[row[0].row].height = max(18, math.ceil(width / 48) * 15)
+    for column, width in (("A", 18), ("B", 40), ("C", 52)):
+        ws.column_dimensions[column].width = width
 
 
+def _annual_book(result):
+    rows = []
+    for r in _frame(result, "annual_returns").to_dict("records"):
+        start, end = _date(r["first_date"], "annual first date"), _date(r["last_date"], "annual last date")
+        if start.month > 1:
+            label = f"{start.year}年{start:%m-%d}起"
+        elif end.month < 12:
+            label = f"{start.year}年截至{end:%m-%d}"
+        else:
+            label = f"{start.year}年"
+        rows.append([label, _value(r, "return", "total_return", "net_return"), r.get("benchmark_return"), r.get("excess_return"),
+                     r.get("annualized_volatility"), r.get("tracking_error"), r.get("sharpe_ratio"), r.get("sortino_ratio"), r.get("information_ratio"),
+                     r.get("max_drawdown"), r.get("benchmark_max_drawdown"), r.get("excess_max_drawdown"), r.get("calmar_ratio"), r.get("annualized_one_way_turnover")])
+    book = _new_book()
+    ws = _table(book, "annual_metrics", ANNUAL_HEADERS, rows,
+                percent={"策略收益", "基准收益", "超额收益", "年化波动", "跟踪误差", "策略最大回撤", "基准最大回撤", "超额最大回撤"},
+                decimal={"Sharpe", "Sortino", "信息比率", "Calmar"}, max_width=24)
+    for row in ws.iter_rows(min_row=2, min_col=14, max_col=14):
+        row[0].number_format = '0.00"倍"'
+    return book
 
 
+def _performance_book(result, inputs, mode):
+    book = _new_book()
+    ws = _table(book, "performance", ["类别", "指标", "全天候策略"], _performance_rows(result), max_width=30)
+    _style_performance(ws)
+    _write_parameters(book, inputs, result["summary"], mode)
+    return book
 
 
+def _instrument_name(code, inputs):
+    names = inputs.get("instrument_names", {})
+    if not isinstance(names, dict):
+        raise ValueError("instrument_names must be a dictionary")
+    return names.get(code, code)
 
 
+def _holdings_book(result, inputs):
+    records = []
+    frame = _frame(result, "instrument_daily", ("date", "instrument_code", "asset_class", "units_end", "exposure_end"))
+    for r in frame.to_dict("records"):
+        if r["units_end"] != 0:
+            records.append([int(_date(r["date"], "holding date").strftime("%Y%m%d")), r["instrument_code"],
+                            _instrument_name(r["instrument_code"], inputs), r["exposure_end"], GROUP_NAMES[r["asset_class"]]])
+    book = _new_book()
+    ws = _table(book, "holdings", ["日期", "品种代码", "品种名称", "名义敞口", "资产组"], records, decimal={"名义敞口"})
+    for column, width in (("A", 14), ("B", 18), ("C", 38), ("D", 16), ("E", 18)):
+        ws.column_dimensions[column].width = width
+    return book
 
 
+def _daily_records(result):
+    daily = _frame(result, "daily_nav", ("date", "normalized_nav", "drawdown"))
+    if daily.empty:
+        raise ValueError("Daily NAV is empty")
+    dates = pd.DatetimeIndex([_date(v, "daily date") for v in daily["date"]])
+    if dates.has_duplicates or not dates.is_monotonic_increasing:
+        raise ValueError("Daily dates must be unique and ascending")
+    baseline = _date(result["summary"]["baseline_date"], "baseline_date")
+    if baseline >= dates[0]:
+        raise ValueError("Baseline date must precede the first return date")
+    return daily.to_dict("records"), baseline
 
 
+def _time_series_book(result):
+    daily, baseline = _daily_records(result)
+    group_frame = _frame(result, "group_daily", ("date", "asset_class", "exposure_end"))
+    if group_frame.duplicated(["date", "asset_class"]).any():
+        raise ValueError("Duplicate daily group exposures")
+    group_map = {(pd.Timestamp(r["date"]), r["asset_class"]): r["exposure_end"] for r in group_frame.to_dict("records")}
+    if any((pd.Timestamp(r["date"]), g) not in group_map for r in daily for g in GROUP_ORDER):
+        raise ValueError("Missing daily group exposures")
+    headers = ["日期", "策略日收益", "策略累计净值", "基准日收益", "基准累计净值", "主动日收益", "超额净值",
+               "每日换仓比率（单边）", "策略可容纳规模（亿元）", "策略回撤", "毛敞口", "非债敞口",
+               "股票敞口", "债券敞口", "黄金敞口", "其他商品敞口", "当日手续费", "当日滑点", "当日交易成本",
+               "当日交易成本率", "累计交易成本率", "滚动年化波动率", "目标年化波动率", "调仓时预测年化波动率"]
+    headers += ["基准回撤", "超额回撤", *FUNDING_COLUMNS.values()]
+    first = [_BLANK] * len(headers)
+    first[0], first[2] = baseline, 1.0
+    first[4], first[6] = 1., 1.
+    rows = [first]
+    for r in daily:
+        rows.append([r["date"], r["net_return"], r["normalized_nav"], r["benchmark_return"], r["benchmark_nav"], r["active_return"], r["relative_nav"],
+                     r.get("one_way_turnover", r.get("turnover", 0.) / 2), _BLANK, r["drawdown"], r["gross_exposure"], r["non_bond_exposure"],
+                     *[group_map[(pd.Timestamp(r["date"]), g)] for g in GROUP_ORDER],
+                     r["fee"], r["slippage"], r["total_cost"], r.get("cost_rate"), r.get("cumulative_cost_rate"),
+                     r.get("realized_volatility_rolling"), r.get("target_volatility"), r.get("forecast_volatility_at_rebalance"),
+                     r["benchmark_drawdown"], r["relative_drawdown"], *_funding_values(r)])
+    book = _new_book()
+    percentages = set(headers) - {"日期", "策略累计净值", "基准累计净值", "超额净值", "策略可容纳规模（亿元）", "当日手续费", "当日滑点", "当日交易成本"}
+    percentages = (percentages - set(FUNDING_COLUMNS.values())) | FUNDING_PERCENT
+    ws = _table(book, "time_series", headers, rows, percent=percentages,
+                decimal={"策略累计净值", "基准累计净值", "超额净值", "策略可容纳规模（亿元）", "当日手续费", "当日滑点", "当日交易成本"} | FUNDING_DECIMAL, max_width=34)
+    for column, width in {"A": 15, "B": 20, "C": 20, "D": 28, "E": 20, "F": 20, "G": 20, "H": 28, "I": 30}.items():
+        ws.column_dimensions[column].width = width
+    for row in ws.iter_rows(min_row=2, min_col=9, max_col=9):
+        row[0].number_format = "0.0000"
+    return book
 
 
+def _audit_table(book, name, frame, labels, percent=(), decimal=(), integer=()):
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(f"{name} must be a DataFrame")
+    keys = list(labels)
+    rows = [[r.get(k) for k in keys] for r in frame.to_dict("records")]
+    return _table(book, name, list(labels.values()), rows, percent=percent, decimal=decimal, integer=integer, max_width=36)
 
 
+def _details_book(result, inputs, sources):
+    book = _new_book()
+    daily = _frame(result, "daily_nav").to_dict("records")
+    by_date = {pd.Timestamp(r["date"]): r for r in daily}
+    daily_rows = [[r["date"], r["nav"], r["normalized_nav"], r["gross_exposure"] * r["nav"], r["gross_exposure"], r["non_bond_exposure"],
+                   r["trading_pnl"], r["fee"], r["slippage"], r["total_cost"],
+                   "否" if _missing(r.get("rebalance_no")) else "是", r.get("held_signal_date"), r.get("rebalance_no"), *_funding_values(r)]
+                  for r in daily]
+    _table(book, "账户每日状态", ["日期", "组合净资产", "组合累计净值", "名义敞口金额", "毛敞口", "非债敞口",
+           "当日交易盈亏", "手续费", "滑点", "交易成本", "当天是否调仓", "当前信号日", "调仓序号", *FUNDING_COLUMNS.values()], daily_rows,
+           percent={"毛敞口", "非债敞口"} | FUNDING_PERCENT, decimal={"组合净资产", "组合累计净值", "名义敞口金额", "当日交易盈亏", "手续费", "滑点", "交易成本"} | FUNDING_DECIMAL, integer={"调仓序号"}, max_width=24)
+    holding_rows, trade_rows = [], []
+    for r in _frame(result, "instrument_daily").to_dict("records"):
+        code, day = r["instrument_code"], pd.Timestamp(r["date"])
+        name, group = _instrument_name(code, inputs), GROUP_NAMES[r["asset_class"]]
+        signal = by_date[day].get("held_signal_date")
+        holding_rows.append([r["date"], signal, code, name, group, r["units_end"], r["price"],
+                             r["units_end"] * r["price"], r["exposure_end"], r["pnl"], r["net_return_contribution"],
+                             "期末持有" if r["units_end"] != 0 else "当日已平仓"])
+        if r["traded_notional"] != 0:
+            trade_rows.append([r["date"], signal, code, name, group, "买入" if r["traded_notional"] > 0 else "卖出",
+                               r["units_start"] * r["price"], r["units_end"] * r["price"], abs(r["traded_notional"]),
+                               r["traded_notional"], r["fee"], r["slippage"], r["total_cost"]])
+    _table(book, "账户持仓", ["日期", "信号日", "品种代码", "品种名称", "资产组", "序列单位数", "参考价格", "名义敞口金额",
+           "对组合名义敞口", "当日盈亏", "净收益贡献", "持仓状态"], holding_rows, percent={"对组合名义敞口", "净收益贡献"},
+           decimal={"序列单位数", "参考价格", "名义敞口金额", "当日盈亏"}, max_width=32)
+    _table(book, "账户交易", ["成交日期", "信号日", "品种代码", "品种名称", "资产组", "交易方向", "交易前名义金额", "最新目标名义金额",
+           "实际成交金额", "有符号成交金额", "手续费", "滑点", "交易成本"], trade_rows,
+           decimal={"交易前名义金额", "最新目标名义金额", "实际成交金额", "有符号成交金额", "手续费", "滑点", "交易成本"}, max_width=32)
+    allocation_rows = []
+    for r in _frame(result, "rebalance_allocations").to_dict("records"):
+        allocation_rows.append([r["date"], r["rebalance_no"], r["instrument_code"], GROUP_NAMES[r["asset_class"]],
+                                r["target_exposure"], r["capital_weight"], r["target_notional"], r["capital_amount"], r["bond_margin_rate"]])
+    _table(book, "调仓资金分配", ["日期", "调仓序号", "品种代码", "资产组", "目标名义敞口", "目标资金占比", "目标名义金额", "分配资金", "调仓目标国债保证金率"],
+           allocation_rows, percent={"目标名义敞口", "目标资金占比", "调仓目标国债保证金率"}, decimal={"目标名义金额", "分配资金"}, integer={"调仓序号"})
+    status_labels = {"target_achieved": "达到目标波动", "cap_limited": "资金约束限制", "not_loaded_not_required": "未执行，无需读取优化结果"}
+    action_labels = {"executed": "已执行", "no_execution_date": "无后续执行日", "after_end_not_executed": "执行日在回测结束之后",
+                     "before_start_not_inherited": "执行日在回测开始之前，未承接持仓"}
+    signals = _frame(result, "signals").copy()
+    if "optimization_status" in signals:
+        signals["optimization_status"] = signals["optimization_status"].map(lambda v: status_labels.get(v, v))
+    if "backtest_action" in signals:
+        signals["backtest_action"] = signals["backtest_action"].map(lambda v: action_labels.get(v, v))
+    _audit_table(book, "调仓信号", signals, {"rebalance_no": "调仓序号", "signal_date": "信号日", "execution_date": "执行日",
+                 "optimization_status": "优化状态", "backtest_action": "回测处理", "target_volatility": "目标年化波动率",
+                 "forecast_volatility": "预测年化波动率", "bond_leverage_cap": "国债杠杆上限", "bond_margin_floor": "最低保证金率",
+                 "target_bond_margin_rate": "调仓目标国债保证金率", "source_path": "来源路径", "source_sha256": "来源SHA256"},
+                 percent={"目标年化波动率", "预测年化波动率", "最低保证金率", "调仓目标国债保证金率"}, integer={"调仓序号"})
+    attribution = _frame(result, "attribution").copy()
+    if len(attribution):
+        attribution["name"] = [GROUP_NAMES.get(r["name"], r["name"]) if r["level"] == "group" else
+                               f"{r['name']} {_instrument_name(r['name'], inputs)}" for r in attribution.to_dict("records")]
+        attribution["level"] = attribution["level"].map({"group": "资产组", "instrument": "品种"})
+    _audit_table(book, "收益归因", attribution, {"level": "层级", "name": "资产", "trading_pnl": "累计交易盈亏", "fee": "累计手续费",
+                 "slippage": "累计滑点", "total_cost": "累计交易成本", "net_pnl": "累计净盈亏", "contribution_to_total_return": "对累计收益的贡献"},
+                 percent={"对累计收益的贡献"}, decimal={"累计交易盈亏", "累计手续费", "累计滑点", "累计交易成本", "累计净盈亏"})
+    checks = _frame(result, "checks").copy()
+    if "passed" in checks:
+        checks["passed"] = checks["passed"].map(lambda v: "通过" if isinstance(v, (bool, np.bool_)) and v else "未通过")
+    _audit_table(book, "校验", checks, {"check": "校验项目", "error": "误差", "tolerance": "容差", "passed": "是否通过", "detail": "说明"}, decimal={"误差", "容差"})
+    source_rows = []
+    for r in sources:
+        source_rows.append([r.get("kind", r.get("source_type")), r.get("path", r.get("source_path")), r.get("sha256", r.get("source_sha256")),
+                            r.get("source_price_sha256", _BLANK)])
+    source_ws = _table(book, "来源", ["来源类型", "来源路径", "SHA256", "优化时价格SHA256"], source_rows, max_width=50)
+    source_ws.column_dimensions["B"].width = 75
+    source_ws.column_dimensions["C"].width = 67
+    source_ws.column_dimensions["D"].width = 67
+    for row in source_ws.iter_rows(min_row=2):
+        row[1].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        source_ws.row_dimensions[row[0].row].height = max(18, math.ceil(len(str(row[1].value)) / 70) * 15)
+    return book
 
 
+def save_backtest_reports(output_dir, result, inputs, sources, *, mode="next_day_close", overwrite=False) -> list[Path]:
+    paths = report_paths(output_dir, mode)
+    for path in paths:
+        _validate_destination(path, overwrite)
+    books = []
+    try:
+        books.append(_annual_book(result))
+        books.append(_performance_book(result, inputs, mode))
+        books.append(_holdings_book(result, inputs))
+        books.append(_time_series_book(result))
+        books.append(_details_book(result, inputs, sources))
+        for path, book in zip(paths, books):
+            _save(book, path, overwrite)
+    finally:
+        for book in books:
+            book.close()
+    return paths
 
 
+def save_comparison(path, results_by_scenario, inputs, overwrite=False):
+    _validate_destination(Path(path), overwrite)
+    if not results_by_scenario:
+        raise ValueError("No backtest results to compare")
+    columns = {"target_volatility": "目标年化波动率", "bond_leverage_cap": "国债杠杆上限", "bond_margin_floor": "最低保证金率",
+               "annualized_return": "策略年化收益", "benchmark_annualized_return": "基准年化收益", "annualized_excess_return": "年化超额收益",
+               "annualized_volatility": "策略年化波动率", "max_drawdown": "最大回撤", "sharpe_ratio": "Sharpe",
+               "tracking_error": "跟踪误差", "information_ratio": "IR", "annualized_one_way_turnover": "年化单边换手率",
+               "cumulative_cost_rate": "累计交易成本率", "minimum_bond_margin_rate": "最低观察保证金率",
+               "maximum_bond_leverage": "最高观察杠杆", "margin_breach_days": "约束越界天数",
+               "bond_capital_depleted_days": "国债资金耗尽天数", "target_achieved_count": "达到目标波动次数",
+               "cap_limited_count": "资金约束限制次数", "capital_constraint_status": "资金约束状态"}
+    records, nav_series, drawdown_series = [], [], []
+    labels = []
+    common_dates, common_benchmark = None, None
+    for (target, limit), result in sorted(results_by_scenario.items()):
+        target = _number(target, "target_volatility", True)
+        limit = _number(limit, "bond_leverage_cap", True)
+        _same_number(result["summary"]["target_volatility"], target, "scenario target")
+        _same_number(result["summary"]["bond_leverage_cap"], limit, "scenario leverage cap")
+        label = f"目标{target * 100:g}%_国债上限{limit:g}倍"
+        if label in labels:
+            raise ValueError("Duplicate target labels")
+        labels.append(label)
+        records.append([result["summary"].get(key) for key in columns])
+        daily, baseline = _daily_records(result)
+        dates = pd.DatetimeIndex([baseline, *[r["date"] for r in daily]])
+        benchmark = np.array([1., *[r["benchmark_nav"] for r in daily]])
+        if common_dates is None:
+            common_dates, common_benchmark = dates, benchmark
+        elif not common_dates.equals(dates) or not np.array_equal(common_benchmark, benchmark):
+            raise ValueError("Scenario comparisons require identical dates and benchmark paths")
+        nav_series.append(pd.Series([1., *[r["normalized_nav"] for r in daily]], index=dates, name=label))
+        drawdown_series.append(pd.Series([0., *[r["drawdown"] for r in daily]], index=dates, name=label))
+    nav_series.append(pd.Series(common_benchmark, index=common_dates, name="沪深300全收益"))
+    drawdown_series.append(pd.Series(common_benchmark / np.maximum.accumulate(common_benchmark) - 1, index=common_dates, name="沪深300全收益"))
+    book = _new_book()
+    try:
+        _table(book, "指标对比", list(columns.values()), records,
+               percent={"目标年化波动率", "最低保证金率", "策略年化收益", "基准年化收益", "年化超额收益", "策略年化波动率",
+                        "最大回撤", "跟踪误差", "累计交易成本率", "最低观察保证金率"},
+               decimal={"国债杠杆上限", "Sharpe", "IR", "年化单边换手率", "最高观察杠杆"},
+               integer={"约束越界天数", "国债资金耗尽天数", "达到目标波动次数", "资金约束限制次数"}, max_width=30)
+        for name, series, percentages in (("净值对比", nav_series, False), ("回撤对比", drawdown_series, True)):
+            frame = pd.concat(series, axis=1).sort_index().rename_axis("日期").reset_index()
+            records = [[_BLANK if _missing(v) else v for v in row] for row in frame.itertuples(index=False, name=None)]
+            value_columns = list(frame.columns[1:])
+            _table(book, name, frame.columns, records, percent=value_columns if percentages else (), decimal=() if percentages else value_columns, max_width=24)
+        _write_parameters(book, {**inputs, "targets": tuple(sorted({key[0] for key in results_by_scenario})),
+                                 "leverage_caps": tuple(sorted({key[1] for key in results_by_scenario}, reverse=True))}, sheet="参数")
+        _save(book, Path(path), overwrite)
+    except BaseException:
+        book.close()
+        raise
