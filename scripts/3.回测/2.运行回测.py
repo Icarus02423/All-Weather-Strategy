@@ -1,3 +1,9 @@
+"""独立读取已验收优化结果，运行回测并导出 Excel；不调用优化，不改 main。
+
+默认：63日回看/月调仓/5%、10%、15%目标，2015-01-01至2026-09-30。
+每个目标与国债杠杆上限组合输出五个 Excel、六张 PNG；同方案另有参数对比。默认拒绝覆盖。
+导入无读写副作用；run_backtests 返回结构化结果，参数不依赖外部 main。
+"""
 from __future__ import annotations
 
 import argparse
@@ -116,6 +122,7 @@ def _check_outputs(destinations, output_root, protected, overwrite):
 
 
 def _check_schedule_coverage(calendar, records, start, end, frequency):
+    """核对已到期的月末/季末/半年末信号，允许在两次调仓之间结束回测。"""
     if not records:
         raise ValueError("No preparation schedule rows for the selected scheme")
     months = {"monthly": 1, "quarterly": 3, "semiannual": 6}[frequency]
@@ -150,6 +157,11 @@ def run_backtests(*, project_root=PROJECT_ROOT, lookback_period=LOOKBACK_PERIOD,
                   risk_free_rate=RISK_FREE_RATE, rolling_window=ROLLING_WINDOW,
                   prices_path=None, schedule_path=None, benchmark_path=None, optimization_root=None,
                   output_root=None, overwrite=OVERWRITE_OUTPUTS):
+    """读取一个窗口/频率，逐目标与杠杆上限计算；全部输入/计算通过后才导出。
+
+    所需调仓文件缺失或失败立即报错，不跳期、不用旧仓掩盖优化失败。
+    起点空仓；仅执行起止范围内的安排。末日无执行日期的信号只作记录。
+    """
     runner_hash = globals().get("__source_sha256__") or _digest(Path(__file__))
     root = Path(project_root).resolve()
     if lookback_period not in WINDOWS or rebalance_frequency not in FREQUENCIES:
