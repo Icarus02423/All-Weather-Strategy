@@ -151,8 +151,52 @@ def _post_cost_nav(nav_before, old_notional, targets, rate):
     return value
 
 
+def _metrics(returns, annualization, risk_free_rate, nav_values, initial_nav, dates, baseline_date):
+    returns = np.asarray(returns, dtype=float)
+    count = len(returns)
+    nav_values = np.asarray(nav_values, dtype=float)
+    total = float(nav_values[-1] / initial_nav - 1)
+    # 先减 1 会把很小但正的财富比舍入成 -1，不能再对 total 做 log1p。
+    try:
+        annual_return = math.expm1((math.log(float(nav_values[-1])) - math.log(initial_nav)) * annualization / count)
+    except OverflowError:
+        annual_return = None
+    vol = float(np.std(returns, ddof=1) * math.sqrt(annualization)) if count > 1 else None
+    risk_free_daily = math.expm1(math.log1p(risk_free_rate) / annualization)
+    excess_returns = returns - risk_free_daily
+    annual_excess = float(np.mean(excess_returns) * annualization)
+    sharpe = annual_excess / vol if vol is not None and vol > 1e-14 else None
+    # ETF 口径：所有观察日均进入均方分母，上行日的下行偏差为零。
+    downside = float(np.sqrt(np.mean(np.minimum(excess_returns, 0.) ** 2)) * math.sqrt(annualization))
+    sortino = annual_excess / downside if downside > 0 else None
+    if sortino is not None and not math.isfinite(sortino):
+        sortino = None
+    nav_path = np.r_[initial_nav, nav_values]
+    peak = np.maximum.accumulate(nav_path)
+    drawdown_path = nav_path / peak - 1
+    trough_position = int(np.argmin(drawdown_path))
+    maximum_drawdown = float(-drawdown_path[trough_position])
+    drawdown_start = drawdown_end = None
+    if maximum_drawdown > 0:
+        # 与 ETF 一致：重复峰值取谷值之前最后一次；重复最低回撤取首次谷值。
+        peak_position = int(np.flatnonzero(nav_path[:trough_position + 1] == peak[trough_position])[-1])
+        date_path = [pd.Timestamp(baseline_date), *[pd.Timestamp(day) for day in dates]]
+        drawdown_start, drawdown_end = date_path[peak_position], date_path[trough_position]
+    return {"observations": count, "total_return": total, "annualized_return": annual_return,
+            "annualized_volatility": vol, "sharpe_ratio": sharpe, "sortino_ratio": sortino,
+            "max_drawdown": maximum_drawdown, "max_drawdown_start": drawdown_start,
+            "max_drawdown_end": drawdown_end,
+            "calmar_ratio": annual_return / maximum_drawdown if annual_return is not None and maximum_drawdown > 1e-14 else None,
+            "annualized_return_status": "defined" if annual_return is not None else "outside_float_range",
+            "positive_day_fraction": float(np.mean(returns > 0))}
 
 
+def _turnover_metrics(rows, annualization):
+    # 仅排除全回测的首次实际建仓；保留其余现金日和非调仓日的零换手。
+    retained = rows.loc[~rows["is_initial_entry"], "one_way_turnover"]
+    amount = float(retained.sum())
+    return {"mean_one_way_turnover": amount / len(retained) if len(retained) else None,
+            "annualized_one_way_turnover": amount / (len(rows) / annualization)}
 
 
 def _funding_state(nav, notionals, groups, floor):
@@ -178,9 +222,72 @@ def _funding_state(nav, notionals, groups, floor):
                 "bond_capital_depleted" if depleted else "below_floor" if breach else "within_limit"}
 
 
+def _benchmark_path(benchmark_prices, calendar, baseline):
+    if not isinstance(benchmark_prices, pd.Series) or benchmark_prices.empty:
+        raise BacktestError("Benchmark prices must be a nonempty Series")
+    index = benchmark_prices.index
+    if (not isinstance(index, pd.DatetimeIndex) or index.hasnans or index.tz is not None
+            or not index.is_unique or not index.is_monotonic_increasing or not index.equals(index.normalize())):
+        raise BacktestError("Benchmark dates must be unique, ascending daily dates")
+    dates = pd.DatetimeIndex([baseline, *calendar])
+    if not dates.isin(index).all():
+        raise BacktestError("Benchmark is missing the common baseline or backtest dates; no filling or truncation")
+    values = np.array([_number(v, "benchmark close") for v in benchmark_prices.loc[dates]])
+    if np.any(values <= 0):
+        raise BacktestError("Benchmark closes must be positive")
+    return values / values[0]
 
 
+def _relative_metrics(rows, annualization, risk_free_rate, baseline):
+    strategy_initial = float(rows["nav_start"].iloc[0])
+    benchmark_initial = float(rows["benchmark_nav_start"].iloc[0])
+    benchmark = _metrics(rows["benchmark_return"], annualization, risk_free_rate, rows["benchmark_nav"],
+                         benchmark_initial, rows["date"], baseline)
+    strategy = _metrics(rows["net_return"], annualization, risk_free_rate, rows["nav"],
+                        strategy_initial, rows["date"], baseline)
+    relative_nav = (rows["nav"] / strategy_initial) / (rows["benchmark_nav"] / benchmark_initial)
+    relative_returns = (1 + rows["net_return"]) / (1 + rows["benchmark_return"]) - 1
+    relative = _metrics(relative_returns, annualization, 0., relative_nav, 1., rows["date"], baseline)
+    active = rows["net_return"] - rows["benchmark_return"]
+    tracking = float(active.std(ddof=1) * math.sqrt(annualization)) if len(rows) > 1 else None
+    annual_difference = (strategy["annualized_return"] - benchmark["annualized_return"]
+                         if strategy["annualized_return"] is not None and benchmark["annualized_return"] is not None else None)
+    return {"benchmark_return": benchmark["total_return"],
+            "benchmark_annualized_return": benchmark["annualized_return"],
+            "benchmark_annualized_volatility": benchmark["annualized_volatility"],
+            "benchmark_max_drawdown": benchmark["max_drawdown"],
+            "benchmark_max_drawdown_start": benchmark["max_drawdown_start"],
+            "benchmark_max_drawdown_end": benchmark["max_drawdown_end"],
+            "excess_return": strategy["total_return"] - benchmark["total_return"],
+            "annualized_excess_return": annual_difference, "relative_total_return": relative["total_return"],
+            "tracking_error": tracking,
+            "information_ratio": float(active.mean() * annualization / tracking) if tracking is not None and tracking > 1e-14 else None,
+            "excess_max_drawdown": relative["max_drawdown"],
+            "excess_max_drawdown_start": relative["max_drawdown_start"],
+            "excess_max_drawdown_end": relative["max_drawdown_end"]}
 
 
+def _period_returns(daily, frequency, annualization, risk_free_rate, baseline_date, baseline_policy):
+    records = []
+    labels = daily["date"].dt.to_period(frequency)
+    for period, rows in daily.groupby(labels, sort=True):
+        initial_nav = float(rows["nav_start"].iloc[0])
+        record = {"period": str(period), "first_date": rows["date"].iloc[0], "last_date": rows["date"].iloc[-1],
+                  "observations": len(rows), "return": float(rows["nav"].iloc[-1] / initial_nav - 1),
+                  "trading_pnl": float(rows["trading_pnl"].sum()), "total_cost": float(rows["total_cost"].sum())}
+        if frequency == "Y":
+            first_position = daily.index.get_loc(rows.index[0])
+            year_baseline = daily["date"].iloc[first_position - 1] if first_position else baseline_date
+            year_policy = "previous_backtest_observation" if first_position else baseline_policy
+            stats = _metrics(rows["net_return"], annualization, risk_free_rate, rows["nav"],
+                             initial_nav, rows["date"], year_baseline)
+            record.update({key: stats[key] for key in (
+                "annualized_volatility", "sharpe_ratio", "sortino_ratio", "max_drawdown",
+                "max_drawdown_start", "max_drawdown_end", "calmar_ratio")})
+            record.update({"annualized_one_way_turnover": _turnover_metrics(rows, annualization)["annualized_one_way_turnover"],
+                           "baseline_date": year_baseline, "baseline_date_policy": year_policy})
+            record.update(_relative_metrics(rows, annualization, risk_free_rate, year_baseline))
+        records.append(record)
+    return pd.DataFrame(records)
 
 
