@@ -1,3 +1,8 @@
+"""沿用 ETF 轮动回测的独立 PNG 格式；不依赖 Excel 内嵌图。
+
+输出含基准的净值、回撤、换手、累计成本、名义敞口和国债资金监控六图。只有调用导出函数
+才加载 matplotlib，使用无界面 Agg 后端；导入本模块不读取行情或创建文件。
+"""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -88,6 +93,7 @@ def _save(figure, path, plt, overwrite):
 
 
 def _exposure_figure(daily, summary, plt, mdates, PercentFormatter):
+    """名义敞口与资金占比分图展示；四条线都标出同日收盘调仓前后的状态。"""
     dates = pd.to_datetime(daily["date"]).to_numpy()
     rebalanced = daily["rebalance_no"].notna().to_numpy()
     nav = daily["nav"].to_numpy(dtype=float)
@@ -158,6 +164,7 @@ def _exposure_figure(daily, summary, plt, mdates, PercentFormatter):
 
 
 def _bond_funding_figure(daily, summary, plt, mdates, PercentFormatter):
+    """每日收盘画连续线；调仓前后仅在实际执行日画点，不改变资金数据。"""
     from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
 
     dates = pd.to_datetime(daily["date"]).to_numpy()
@@ -250,6 +257,7 @@ def _bond_funding_figure(daily, summary, plt, mdates, PercentFormatter):
 
 
 def save_figures(output_dir, result, *, mode="next_day_close", overwrite=False):
+    """六张独立图，含共同基准和收盘资金约束监控。"""
     paths = figure_paths(output_dir, mode)
     for path in paths:
         _check_destination(path, overwrite)
