@@ -1,3 +1,10 @@
+"""加权价格序列敞口回测，记录整体国债资金与保证金率。
+
+执行日先结算旧仓盈亏，再按收盘价格换仓；两次调仓之间固定代理单位。
+目标敞口以扣费后净资产为分母。只计算和返回表格；导入或调用均不写文件。
+开始日期按空仓启动；末日按市值计价，不另行平仓。现金利息固定为零。
+每日收盘检查资金下限，越界只记录，不触发额外交易；不模拟交易所强平。
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -129,6 +136,7 @@ def _prepare_signals(signals, prices):
 
 
 def _post_cost_nav(nav_before, old_notional, targets, rate):
+    """解 V + c*sum(abs(w*V-old_notional)) = V_before，目标相对于扣费后 V。"""
     if rate == 0:
         return nav_before
     if rate * sum(targets.values()) >= 1:
@@ -200,6 +208,7 @@ def _turnover_metrics(rows, annualization):
 
 
 def _funding_state(nav, notionals, groups, floor):
+    """在收盘价格下按同一资金恒等式记账；空仓时不定义国债保证金率。"""
     non_bond = math.fsum(v for c, v in notionals.items() if groups[c] != "bonds")
     bond = math.fsum(v for c, v in notionals.items() if groups[c] == "bonds")
     invested = bond > 0
@@ -293,6 +302,15 @@ def _period_returns(daily, frequency, annualization, risk_free_rate, baseline_da
 
 def backtest(prices, signals, *, benchmark_prices, start_date=None, end_date=None, initial_nav=1.,
              fee_bps=10., slippage_bps=0., annualization=252, risk_free_rate=0., rolling_window=63):
+    """独立回测一个窗口/频率/目标/杠杆上限，返回表格，不读写文件。
+
+    日期范围包含两端；开始日空仓，不承接范围之前的持仓。开始日前已发出、
+    范围内执行的信号可以交易。未持仓品种上市前缺价允许，持仓或交易缺价报错。
+    fee_bps/slippage_bps 按买卖名义金额单边计费；无现金利息或借款。
+    监测整体国债资金下限，越界只记录，不临时减仓；基准必须覆盖共同基线和全区间。
+    默认单边10基点（0.1%）合并估算手续费和滑点，计入 fee_bps；额外滑点默认零。
+    risk_free_rate 仅用于 Sharpe/Sortino，不能作为账户现金利息。失败抛 BacktestError。
+    """
     prices = _validate_prices(prices)
     signals, labels = _prepare_signals(list(signals), prices)
     initial_nav = _number(initial_nav, "initial_nav")
